@@ -1,0 +1,75 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Lint with ruff (if available)
+      run: |
+        pip install ruff || true
+        ruff check . || true
+      continue-on-error: true
+
+    - name: Run unit tests
+      run: |
+        pytest tests/test_models.py tests/test_repl_engine.py tests/test_server_init.py -v
+
+    - name: Run integration tests
+      run: |
+        pytest tests/test_integration.py -v
+
+    - name: Run HTTP integration tests
+      run: |
+        pytest tests/test_http_integration.py -v
+      timeout-minutes: 2
+
+    - name: Test CLI
+      run: |
+        repl-mcp --help
+
+  example-scripts:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Run example scripts
+      run: |
+        for script in examples/*.py; do
+          echo "Running $script..."
+          python "$script"
+        done

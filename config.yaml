@@ -1,0 +1,17 @@
+# REPL MCP Server Configuration
+
+# Server settings
+server:
+  transport: sse  # stdio or sse
+  host: 0.0.0.0
+  port: 8000
+
+# REPL settings
+repl:
+  timeout: 30  # Execution timeout in seconds
+  max_output_lines: 1000  # Maximum output lines to capture
+
+# MCP configuration
+mcp:
+  autoconnect: true  # Auto-load servers from .mcp.json on startup
+  config_file: .mcp.json  # Path to MCP config file
