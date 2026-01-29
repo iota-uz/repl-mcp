@@ -103,10 +103,13 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
         yield {}
 
         # --- SHUTDOWN ---
-        print("Shutting down REPL MCP server...")
+        try:
+            print("Shutting down REPL MCP server...")
+        except ValueError:
+            # File may be closed during stdio shutdown
+            pass
         if mcp_wrapper:
             mcp_wrapper.disconnect()
-        print("Cleanup complete.")
 
     return server_lifespan
 
@@ -305,8 +308,8 @@ def main():
     parser.add_argument(
         "--transport",
         choices=["stdio", "sse"],
-        default="sse",
-        help="Transport type (default: sse)",
+        default="stdio",
+        help="Transport type (default: stdio)",
     )
     parser.add_argument(
         "--port",

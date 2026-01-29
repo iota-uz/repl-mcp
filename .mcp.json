@@ -13,9 +13,7 @@
         "--directory",
         ".",
         "run",
-        "repl-mcp",
-        "--transport",
-        "stdio"
+        "repl-mcp"
       ]
     }
   }

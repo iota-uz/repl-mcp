@@ -31,6 +31,8 @@ class TestHTTPServer:
                 str(venv_python),
                 "-m",
                 "repl_mcp.repl_mcp_server",
+                "--transport",
+                "sse",
                 "--port",
                 str(port),
                 "--no-autoconnect",
