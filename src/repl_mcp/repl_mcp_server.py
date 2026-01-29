@@ -95,6 +95,9 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
             if servers:
                 print(f"Auto-connecting to {len(servers)} MCP servers...")
                 results = mcp_wrapper.connect(servers)
+                # If connect returns a Task (because we're in async context), await it
+                if hasattr(results, '__await__'):
+                    results = await results
                 for name, success in results.items():
                     status = "✓" if success else "✗"
                     print(f"  {status} {name}")

@@ -50,6 +50,7 @@ class MCPClientWrapper:
     def __init__(self):
         self._sessions: dict[str, ClientSession] = {}
         self._exit_stacks: dict[str, AsyncExitStack] = {}
+        self._errlogs: dict[str, Any] = {}  # Track errlog file handles
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.tools = ToolsContainer(self)
 
@@ -105,8 +106,13 @@ class MCPClientWrapper:
                     env=env,
                 )
 
+                # Redirect child server stderr to suppress banner messages
+                # This prevents output like "GitHub MCP Server running on stdio" from appearing
+                errlog = open(os.devnull, 'w')
+                self._errlogs[name] = errlog
+
                 stdio_transport = await exit_stack.enter_async_context(
-                    stdio_client(server_params)
+                    stdio_client(server_params, errlog=errlog)
                 )
                 stdio, write = stdio_transport
                 session = await exit_stack.enter_async_context(
@@ -133,6 +139,13 @@ class MCPClientWrapper:
             if name in self._exit_stacks:
                 await self._exit_stacks[name].aclose()
                 del self._exit_stacks[name]
+            # Clean up errlog if connection failed
+            if name in self._errlogs:
+                try:
+                    self._errlogs[name].close()
+                except Exception:
+                    pass
+                del self._errlogs[name]
             return False
 
     def connect(self, servers: dict[str, dict]) -> dict[str, bool]:
@@ -224,6 +237,13 @@ class MCPClientWrapper:
                     del self._exit_stacks[name]
                 if name in self._sessions:
                     del self._sessions[name]
+                # Close errlog file handle
+                if name in self._errlogs:
+                    try:
+                        self._errlogs[name].close()
+                    except Exception:
+                        pass
+                    del self._errlogs[name]
 
         self._run_async(disconnect_all())
 
