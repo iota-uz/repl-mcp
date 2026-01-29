@@ -154,7 +154,7 @@ def connect_mcp_servers(servers: dict) -> dict[str, bool]:
                 "command": "npx",
                 "args": ["-y", "@modelcontextprotocol/server-github"],
                 "env": {
-                    "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+                    "GITHUB_TOKEN": "${GH_TOKEN}"
                 }
             }
         })

@@ -47,7 +47,7 @@ Create `.mcp.json` in the project root to auto-connect to MCP servers on startup
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
-        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+        "GITHUB_TOKEN": "${GH_TOKEN}"
       }
     },
     "playwright": {
@@ -138,7 +138,7 @@ connect_mcp_servers(servers={
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-github"],
         "env": {
-            "GITHUB_TOKEN": "your_token_here"
+            "GITHUB_TOKEN": "${GH_TOKEN}"
         }
     }
 })
@@ -213,7 +213,7 @@ Options:
 
 ### Environment Variables
 
-- `GITHUB_TOKEN` - GitHub personal access token (if using GitHub MCP)
+- `GH_TOKEN` - GitHub personal access token (if using GitHub MCP)
 - Other environment variables as required by your MCP servers
 
 ## Claude Desktop Integration
@@ -434,7 +434,7 @@ repl_mcp/
 
 - Ensure server connected successfully: `list_connected_servers()`
 - Check server is running (for HTTP/SSE servers)
-- Verify authentication (e.g., GITHUB_TOKEN for GitHub)
+- Verify authentication (e.g., GH_TOKEN for GitHub)
 
 ## License
 
