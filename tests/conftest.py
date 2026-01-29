@@ -1,8 +1,12 @@
 """Pytest configuration and fixtures."""
 
+import os
 import pytest
+from pathlib import Path
 from repl_mcp.repl_engine import REPLEngine
 from repl_mcp.mcp_client_wrapper import MCPClientWrapper
+
+PROJECT_ROOT = Path(__file__).parent.parent
 
 
 @pytest.fixture
@@ -32,3 +36,17 @@ def mcp_wrapper():
     yield wrapper
     # Cleanup
     wrapper.disconnect()
+
+
+@pytest.fixture
+def project_root():
+    """Provide project root path."""
+    return PROJECT_ROOT
+
+
+@pytest.fixture
+def clean_environment():
+    """Ensure clean test environment."""
+    original_dir = os.getcwd()
+    yield
+    os.chdir(original_dir)

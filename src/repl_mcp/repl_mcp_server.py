@@ -3,6 +3,7 @@
 import sys
 import json
 import argparse
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -15,6 +16,28 @@ from .mcp_client_wrapper import MCPClientWrapper
 # Global instances
 mcp_wrapper: Optional[MCPClientWrapper] = None
 repl_engine: Optional[REPLEngine] = None
+
+
+def setup_logging(transport: str, debug: bool = False) -> logging.Logger:
+    """
+    Configure logging to avoid stdout pollution in SSE mode.
+
+    Args:
+        transport: Transport type ('stdio' or 'sse')
+        debug: Enable debug logging to stdout even in SSE mode
+
+    Returns:
+        Logger instance
+    """
+    if transport == "sse" and not debug:
+        # Log to stderr to keep stdout clean for SSE
+        handler = logging.StreamHandler(sys.stderr)
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+
+    handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    return logging.getLogger(__name__)
 
 
 def load_mcp_config(config_path: Path = Path(".mcp.json")) -> dict:
@@ -35,7 +58,7 @@ def load_mcp_config(config_path: Path = Path(".mcp.json")) -> dict:
         servers = config.get("mcpServers", {})
         return servers
     except Exception as e:
-        print(f"Warning: Failed to load {config_path}: {e}")
+        logging.warning(f"Failed to load {config_path}: {e}")
         return {}
 
 
@@ -60,13 +83,14 @@ def filter_servers(servers: dict, exclude: list[str] = None) -> dict:
     }
 
 
-def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
+def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger: logging.Logger):
     """
     Factory to create a lifespan function with captured config.
 
     Args:
         config_path: Path to .mcp.json config file
         autoconnect_enabled: Whether to auto-connect to servers
+        logger: Logger instance for output
 
     Returns:
         Async context manager for server lifespan
@@ -78,7 +102,7 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
         global mcp_wrapper, repl_engine
 
         # --- STARTUP ---
-        print("Initializing REPL MCP server...")
+        logger.info("Initializing REPL MCP server...")
 
         # Initialize MCP wrapper
         mcp_wrapper = MCPClientWrapper()
@@ -94,21 +118,21 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
             servers = filter_servers(servers, exclude=["python-repl"])
 
             if servers:
-                print(f"Auto-connecting to {len(servers)} MCP servers...")
+                logger.info(f"Auto-connecting to {len(servers)} MCP servers...")
                 results = mcp_wrapper.connect(servers)
                 # If connect returns a Task (because we're in async context), await it
                 if hasattr(results, '__await__'):
                     results = await results
                 for name, success in results.items():
                     status = "✓" if success else "✗"
-                    print(f"  {status} {name}")
+                    logger.info(f"  {status} {name}")
 
         # Yield control - server runs here
         yield {}
 
         # --- SHUTDOWN ---
         try:
-            print("Shutting down REPL MCP server...")
+            logger.info("Shutting down REPL MCP server...")
         except ValueError:
             # File may be closed during stdio shutdown
             pass
@@ -119,7 +143,9 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool):
 
 
 def create_server(
-    config_path: Path = Path(".mcp.json"), autoconnect: bool = True
+    config_path: Path = Path(".mcp.json"),
+    autoconnect: bool = True,
+    logger: logging.Logger = None
 ) -> FastMCP:
     """
     Create and configure the FastMCP server.
@@ -127,12 +153,15 @@ def create_server(
     Args:
         config_path: Path to .mcp.json config file
         autoconnect: Whether to auto-connect to servers
+        logger: Logger instance for output
 
     Returns:
         Configured FastMCP server instance
     """
     # Create lifespan
-    lifespan = create_server_lifespan(config_path, autoconnect)
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    lifespan = create_server_lifespan(config_path, autoconnect, logger)
 
     # Create server with lifespan
     mcp_server = FastMCP("python-repl", lifespan=lifespan)
@@ -299,11 +328,32 @@ def initialize_server(autoconnect: bool = True, config_path: Path = Path(".mcp.j
         servers = filter_servers(servers, exclude=["python-repl"])
 
         if servers:
-            print(f"Auto-connecting to {len(servers)} MCP servers from {config_path}...")
+            logger = logging.getLogger(__name__)
+            logger.info(f"Auto-connecting to {len(servers)} MCP servers from {config_path}...")
             results = mcp_wrapper.connect(servers)
             for name, success in results.items():
                 status = "✓" if success else "✗"
-                print(f"  {status} {name}")
+                logger.info(f"  {status} {name}")
+
+
+def check_port_available(port: int) -> bool:
+    """
+    Check if port is available before starting server.
+
+    Args:
+        port: Port number to check
+
+    Returns:
+        True if port is available, False otherwise
+    """
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('0.0.0.0', port))
+        sock.close()
+        return True
+    except OSError:
+        return False
 
 
 def main():
@@ -337,12 +387,29 @@ def main():
         action="store_true",
         help="Disable auto-connecting to servers from .mcp.json",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging to stdout (even in SSE mode)",
+    )
 
     args = parser.parse_args()
 
+    # Setup logging before server starts
+    logger = setup_logging(args.transport, args.debug)
+
+    # Check port availability for SSE mode
+    if args.transport == "sse":
+        if not check_port_available(args.port):
+            logger.error(f"Port {args.port} is already in use")
+            logger.error("Try: uv run repl-mcp --transport sse --port <different-port>")
+            sys.exit(1)
+
     # Create server with lifespan (initialization happens automatically)
     mcp_server = create_server(
-        config_path=args.config, autoconnect=not args.no_autoconnect
+        config_path=args.config,
+        autoconnect=not args.no_autoconnect,
+        logger=logger
     )
 
     # Run server

@@ -10,8 +10,6 @@
     "python-repl": {
       "command": "uv",
       "args": [
-        "--directory",
-        ".",
         "run",
         "repl-mcp",
         "--transport",
