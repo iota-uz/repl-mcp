@@ -13,8 +13,11 @@
         "--directory",
         ".",
         "run",
-        "repl-mcp"
-      ]
+        "repl-mcp",
+        "--transport",
+        "sse"
+      ],
+      "url": "http://localhost:8000/sse"
     }
   }
 }

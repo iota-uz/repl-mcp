@@ -67,12 +67,10 @@ class MCPClientWrapper:
     def _run_async(self, coro):
         """Run async coroutine in sync context."""
         loop = self._get_loop()
+        # With nest_asyncio, we can always use run_until_complete
+        # even when the loop is already running
         try:
-            # If loop is already running, create task
-            if loop.is_running():
-                return asyncio.ensure_future(coro, loop=loop)
-            else:
-                return loop.run_until_complete(coro)
+            return loop.run_until_complete(coro)
         except RuntimeError:
             # Fallback to creating new loop
             new_loop = asyncio.new_event_loop()

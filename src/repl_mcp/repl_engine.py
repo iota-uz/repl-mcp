@@ -3,6 +3,7 @@
 import sys
 import ast
 import time
+import asyncio
 import traceback
 from io import StringIO
 from typing import Optional, Any
@@ -66,6 +67,16 @@ class REPLEngine:
                 expr_code = compile(ast.Expression(body=final_expr.value), "<repl>", "eval")
                 with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
                     return_value = eval(expr_code, self.globals, self.globals)
+
+                    # If result is awaitable (Task or coroutine), await it
+                    if asyncio.iscoroutine(return_value) or asyncio.isfuture(return_value):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # We're in an async context, run the coroutine
+                            return_value = loop.run_until_complete(return_value)
+                        except RuntimeError:
+                            # No running loop, create one
+                            return_value = asyncio.run(return_value)
             else:
                 # No trailing expression, just execute
                 with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):

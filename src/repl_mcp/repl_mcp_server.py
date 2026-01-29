@@ -1,5 +1,6 @@
 """FastMCP server exposing stateful Python REPL."""
 
+import sys
 import json
 import argparse
 from contextlib import asynccontextmanager
@@ -348,8 +349,6 @@ def main():
     if args.transport == "stdio":
         mcp_server.run(transport="stdio")
     else:
-        print(f"Starting REPL MCP server on {args.host}:{args.port}")
-        print(f"SSE endpoint: http://{args.host}:{args.port}/sse")
         mcp_server.run(transport="sse", host=args.host, port=args.port)
 
 
