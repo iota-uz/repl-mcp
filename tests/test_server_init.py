@@ -33,16 +33,18 @@ def test_initialize_server_no_autoconnect():
 
 def test_tools_registered():
     """Test that tools are defined in the server module."""
-    # Tools are registered via @mcp.tool() decorator
+    # Tools are registered via @mcp_server.tool() decorators within create_server()
     # Just verify the module structure is correct
     import repl_mcp.repl_mcp_server as server
 
     # Check the server has the expected structure
-    assert hasattr(server, 'mcp')
+    assert hasattr(server, 'create_server')
     assert hasattr(server, 'mcp_wrapper')
     assert hasattr(server, 'repl_engine')
     assert hasattr(server, 'initialize_server')
     assert hasattr(server, 'load_mcp_config')
+    assert hasattr(server, 'filter_servers')
+    assert hasattr(server, 'create_server_lifespan')
 
 
 def test_execute_python_via_engine():

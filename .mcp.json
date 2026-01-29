@@ -6,6 +6,17 @@
       "env": {
         "GITHUB_TOKEN": "${GH_TOKEN}"
       }
+    },
+    "python-repl": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        ".",
+        "run",
+        "repl-mcp",
+        "--transport",
+        "stdio"
+      ]
     }
   }
 }
