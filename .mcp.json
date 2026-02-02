@@ -13,7 +13,8 @@
         "run",
         "repl-mcp",
         "--transport",
-        "sse"
+        "sse",
+        "--no-autoconnect"
       ],
       "url": "http://localhost:8000/sse"
     }
