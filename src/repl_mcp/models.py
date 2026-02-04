@@ -93,6 +93,48 @@ class ExecutionResult(BaseModel):
         description="Non-fatal warnings about execution"
     )
 
+    def __str__(self) -> str:
+        """Format as human-readable plain text output."""
+        parts = []
+
+        # Error case
+        if not self.success and self.exception:
+            exc = self.exception
+            parts.append(f"{exc.type}: {exc.message}")
+            if exc.traceback:
+                # Show abbreviated traceback (skip the wrapper frames)
+                parts.append(exc.traceback.strip())
+            if exc.hints:
+                parts.append("")
+                for hint in exc.hints:
+                    parts.append(f"Hint: {hint}")
+            return "\n".join(parts)
+
+        # Success case
+        if self.stdout:
+            parts.append(self.stdout.rstrip())
+
+        if self.stderr:
+            parts.append(f"[stderr] {self.stderr.rstrip()}")
+
+        if self.return_value is not None and self.return_value != "None":
+            if parts:
+                parts.append("")  # blank line before return value
+            parts.append(f"→ {self.return_value}")
+
+        # Warnings as footer
+        if self.warnings:
+            if parts:
+                parts.append("")
+            for w in self.warnings:
+                parts.append(f"⚠ {w.message}")
+
+        # Nothing to show
+        if not parts:
+            return "(executed successfully)"
+
+        return "\n".join(parts)
+
 
 class ServerConfig(BaseModel):
     """Configuration for an MCP server connection."""
@@ -139,6 +181,11 @@ class CommitInfo(BaseModel):
     committed_date: Optional[datetime] = Field(default=None, description="Commit date")
     files_changed: list[str] = Field(default_factory=list, description="List of changed files")
 
+    def __str__(self) -> str:
+        date_str = self.authored_date.strftime("%Y-%m-%d")
+        msg = self.message[:50] + "..." if len(self.message) > 50 else self.message
+        return f"{self.short_hash} {msg} ({self.author_name}, {date_str})"
+
 
 class FileDiff(BaseModel):
     """Information about a file change in a diff."""
@@ -152,6 +199,12 @@ class FileDiff(BaseModel):
     deletions: int = Field(default=0, description="Lines deleted")
     patch: Optional[str] = Field(default=None, description="Unified diff patch")
 
+    def __str__(self) -> str:
+        symbol = {"added": "A", "modified": "M", "deleted": "D", "renamed": "R", "copied": "C"}[self.change_type]
+        stats = f"+{self.additions}/-{self.deletions}" if self.additions or self.deletions else ""
+        path_info = f"{self.old_path} → {self.path}" if self.old_path else self.path
+        return f"{symbol} {path_info} {stats}".strip()
+
 
 class BlameLine(BaseModel):
     """Information about a line from git blame."""
@@ -163,6 +216,10 @@ class BlameLine(BaseModel):
     author: str = Field(description="Author name")
     author_email: str = Field(description="Author email")
     date: datetime = Field(description="Date of the commit")
+
+    def __str__(self) -> str:
+        date_str = self.date.strftime("%Y-%m-%d")
+        return f"{self.line_num:4d} {self.short_hash} ({self.author}, {date_str}) {self.content}"
 
 
 class GitStatus(BaseModel):
@@ -177,6 +234,26 @@ class GitStatus(BaseModel):
     behind: int = Field(default=0, description="Commits behind tracking branch")
     is_dirty: bool = Field(default=False, description="Whether working tree has changes")
 
+    def __str__(self) -> str:
+        parts = [f"On branch {self.branch}"]
+        if self.tracking_branch:
+            sync = []
+            if self.ahead:
+                sync.append(f"ahead {self.ahead}")
+            if self.behind:
+                sync.append(f"behind {self.behind}")
+            if sync:
+                parts.append(f"({', '.join(sync)} from {self.tracking_branch})")
+        if self.staged:
+            parts.append(f"Staged: {', '.join(self.staged[:3])}{'...' if len(self.staged) > 3 else ''}")
+        if self.unstaged:
+            parts.append(f"Modified: {', '.join(self.unstaged[:3])}{'...' if len(self.unstaged) > 3 else ''}")
+        if self.untracked:
+            parts.append(f"Untracked: {len(self.untracked)} files")
+        if not self.is_dirty:
+            parts.append("Working tree clean")
+        return "\n".join(parts)
+
 
 class BranchInfo(BaseModel):
     """Information about a git branch."""
@@ -187,6 +264,11 @@ class BranchInfo(BaseModel):
     tracking_branch: Optional[str] = Field(default=None, description="Remote tracking branch")
     commit_hash: str = Field(description="Commit hash at branch tip")
     commit_message: str = Field(description="Commit message at branch tip")
+
+    def __str__(self) -> str:
+        prefix = "* " if self.is_current else "  "
+        msg = self.commit_message[:40] + "..." if len(self.commit_message) > 40 else self.commit_message
+        return f"{prefix}{self.name} ({self.commit_hash[:7]}) {msg}"
 
 
 # =============================================================================
@@ -204,6 +286,9 @@ class CallSite(BaseModel):
     full_call: str = Field(description="Full call expression (e.g., 'module.func')")
     context: str = Field(default="", description="Surrounding code context")
 
+    def __str__(self) -> str:
+        return f"{self.file}:{self.line} {self.full_call}()"
+
 
 class FunctionDef(BaseModel):
     """Information about a function definition."""
@@ -219,6 +304,12 @@ class FunctionDef(BaseModel):
     is_method: bool = Field(default=False, description="Whether this is a method")
     decorators: list[str] = Field(default_factory=list, description="Decorator names")
 
+    def __str__(self) -> str:
+        prefix = "async " if self.is_async else ""
+        params = ", ".join(self.params[:3]) + ("..." if len(self.params) > 3 else "")
+        ret = f" -> {self.return_annotation}" if self.return_annotation else ""
+        return f"{self.file}:{self.line} {prefix}def {self.name}({params}){ret}"
+
 
 class ClassDef(BaseModel):
     """Information about a class definition."""
@@ -232,6 +323,11 @@ class ClassDef(BaseModel):
     class_variables: list[str] = Field(default_factory=list, description="Class variable names")
     docstring: Optional[str] = Field(default=None, description="Class docstring")
     decorators: list[str] = Field(default_factory=list, description="Decorator names")
+
+    def __str__(self) -> str:
+        bases = f"({', '.join(self.bases)})" if self.bases else ""
+        methods_count = f" [{len(self.methods)} methods]" if self.methods else ""
+        return f"{self.file}:{self.line} class {self.name}{bases}{methods_count}"
 
 
 class ImportInfo(BaseModel):

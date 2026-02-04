@@ -1,5 +1,6 @@
 """Tests for server initialization."""
 
+import inspect
 from pathlib import Path
 from repl_mcp import repl_mcp_server
 
@@ -76,3 +77,32 @@ def test_list_namespace_vars_via_engine():
 
     assert isinstance(vars_dict, dict)
     assert "test_var" in vars_dict
+
+
+def test_execute_python_no_return_annotation():
+    """
+    Regression test: execute_python must NOT have a return type annotation.
+
+    FastMCP wraps annotated primitive returns (-> str, -> int) in
+    {"result": "..."} JSON via structuredContent. We want plain text output,
+    so the return annotation must be omitted.
+
+    If this test fails, someone added a return type annotation - remove it!
+    """
+    server = repl_mcp_server.create_server()
+
+    # Find the execute_python tool function
+    # FastMCP stores tools internally, but we can check the source
+    import repl_mcp.repl_mcp_server as module
+    source = inspect.getsource(module.create_server)
+
+    # Check that "def execute_python" doesn't have "-> str" or similar
+    # Look for pattern: "def execute_python(...) -> " which would indicate annotation
+    import re
+    pattern = r"def execute_python\([^)]*\)\s*->"
+    match = re.search(pattern, source)
+
+    assert match is None, (
+        "execute_python has a return type annotation! "
+        "This causes FastMCP to wrap output in JSON. Remove the annotation."
+    )

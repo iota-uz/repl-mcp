@@ -131,7 +131,9 @@ class TestClaudeCodeIntegration:
                                     "execute_python",
                                     arguments={"code": "import sys; sys.version"},
                                 )
-                                assert "success" in str(result.content).lower()
+                                # Plain text output includes version string with "→" prefix
+                                output = str(result.content)
+                                assert "3." in output, f"Expected Python version, got: {output}"
 
                                 return
                     except Exception as e:
@@ -176,7 +178,9 @@ class TestClaudeCodeIntegration:
                         "execute_python",
                         arguments={"code": "import sys; sys.version"},
                     )
-                    assert "success" in str(result.content).lower()
+                    # Plain text output includes version string with "→" prefix
+                    output = str(result.content)
+                    assert "3." in output, f"Expected Python version, got: {output}"
 
     def test_port_conflict_detection(self, clean_environment):
         """Test that server detects port conflicts and fails gracefully."""

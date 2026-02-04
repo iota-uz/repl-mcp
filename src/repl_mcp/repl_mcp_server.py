@@ -177,13 +177,17 @@ def create_server(
     mcp_server = FastMCP("python-repl", lifespan=lifespan)
 
     # Register tools
+    #
+    # NOTE: No return type annotation on execute_python intentionally!
+    # Adding `-> str` causes FastMCP to wrap output in {"result": "..."} JSON
+    # via structuredContent. We want plain text output for better readability.
     @mcp_server.tool()
     def execute_python(
         code: str,
         reset: bool = False,
         timeout: float = 120.0,
         inject: Optional[dict] = None
-    ) -> dict:
+    ):
         """
         Execute Python in persistent REPL with codebase utilities.
 
@@ -209,13 +213,13 @@ def create_server(
             inject: Variables to inject (e.g., {"data": [1,2,3]})
 
         Returns:
-            success, stdout, return_value, exception, namespace_vars, warnings
+            Plain text output (stdout, return value, or error message)
         """
         if reset:
             repl_engine.reset_namespace()
 
         result = repl_engine.execute(code, timeout=timeout, inject=inject)
-        return result.model_dump()
+        return str(result)
 
     return mcp_server
 
