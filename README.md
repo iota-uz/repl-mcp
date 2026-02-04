@@ -13,26 +13,52 @@ A Model Context Protocol (MCP) server that provides a stateful Python REPL with 
 
 ## Installation
 
-### Prerequisites
+### Claude Code (Recommended)
 
-Install [UV](https://docs.astral.sh/uv/) (fast Python package manager):
+One command to install:
+
+```bash
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp repl-mcp
+```
+
+That's it. The REPL is now available in Claude Code.
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "python-repl": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp", "repl-mcp"]
+    }
+  }
+}
+```
+
+### Manual Installation
+
+<details>
+<summary>For development or running standalone</summary>
+
+**Prerequisites:** Install [UV](https://docs.astral.sh/uv/):
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### Setup
+**Setup:**
 
 ```bash
-# Clone or create project directory
-cd repl_mcp
-
-# Install dependencies (creates venv and installs packages)
+git clone https://github.com/iota-uz/repl-mcp
+cd repl-mcp
 uv sync
-
-# Or run directly without separate install
 uv run repl-mcp --help
 ```
+
+</details>
 
 ## Quick Start
 
@@ -215,34 +241,6 @@ Options:
 
 - `GH_TOKEN` - GitHub personal access token (if using GitHub MCP)
 - Other environment variables as required by your MCP servers
-
-## Claude Desktop Integration
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "python-repl": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/repl_mcp",
-        "run",
-        "repl-mcp",
-        "--transport",
-        "stdio"
-      ]
-    }
-  }
-}
-```
-
-Benefits of using UV:
-- No need to manually activate virtual environments
-- Automatic dependency management
-- Fast startup with UV's caching
-- Reproducible execution
 
 ## Architecture
 
