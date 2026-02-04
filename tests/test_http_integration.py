@@ -4,6 +4,7 @@ import pytest
 import subprocess
 import time
 import signal
+import socket
 from pathlib import Path
 
 try:
@@ -22,25 +23,43 @@ class TestHTTPServer:
         """Start HTTP server for testing."""
         venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python3"
 
-        # Use a unique port for testing
-        port = 8123
+        def get_free_port() -> int:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                return int(s.getsockname()[1])
 
-        # Start server
-        process = subprocess.Popen(
-            [
-                str(venv_python),
-                "-m",
-                "repl_mcp.repl_mcp_server",
-                "--transport",
-                "sse",
-                "--port",
-                str(port),
-                "--no-autoconnect",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        process = None
+        port = None
+
+        # Start server (retry in case the selected port is taken by the time we spawn)
+        for _ in range(5):
+            port = get_free_port()
+            process = subprocess.Popen(
+                [
+                    str(venv_python),
+                    "-m",
+                    "repl_mcp.repl_mcp_server",
+                    "--transport",
+                    "sse",
+                    "--port",
+                    str(port),
+                    "--no-autoconnect",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.1)
+            if process.poll() is None:
+                break
+            # If we crashed immediately, try another port.
+            process.terminate()
+            process.wait(timeout=2)
+            process = None
+            port = None
+
+        if process is None or port is None:
+            pytest.fail("Server failed to start after multiple port attempts")
 
         # Wait for server to start
         max_wait = 5

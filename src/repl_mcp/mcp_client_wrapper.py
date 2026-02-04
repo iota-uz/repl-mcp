@@ -1,6 +1,7 @@
 """Synchronous wrapper around async MCP SDK for REPL integration."""
 
 import asyncio
+import logging
 import os
 import subprocess
 from typing import Any, Optional
@@ -16,6 +17,8 @@ from .models import ServerConfig
 # Allow nested event loops for sync wrapper
 nest_asyncio.apply()
 
+logger = logging.getLogger(__name__)
+
 
 class ToolNamespace:
     """Dynamic namespace for accessing tools on a specific server."""
@@ -28,7 +31,9 @@ class ToolNamespace:
         """Return callable for the specified tool."""
 
         def tool_caller(**kwargs):
-            return self._client._invoke_tool(self._server, tool_name, **kwargs)
+            # Extract timeout if provided, otherwise use default
+            timeout = kwargs.pop('_timeout', 60.0)
+            return self._client._invoke_tool(self._server, tool_name, timeout=timeout, **kwargs)
 
         return tool_caller
 
@@ -132,8 +137,22 @@ class MCPClientWrapper:
             self._sessions[name] = session
             return True
 
+        except asyncio.CancelledError:
+            # Ensure subprocesses/transports are cleaned up if a connect is cancelled.
+            try:
+                if name in self._exit_stacks:
+                    await self._exit_stacks[name].aclose()
+                    del self._exit_stacks[name]
+            finally:
+                if name in self._errlogs:
+                    try:
+                        self._errlogs[name].close()
+                    except Exception:
+                        pass
+                    del self._errlogs[name]
+            raise
         except Exception as e:
-            print(f"Failed to connect to {name}: {e}")
+            logger.warning("Failed to connect to %s: %s", name, e)
             if name in self._exit_stacks:
                 await self._exit_stacks[name].aclose()
                 del self._exit_stacks[name]
@@ -146,6 +165,62 @@ class MCPClientWrapper:
                 del self._errlogs[name]
             return False
 
+    async def connect_async(
+        self,
+        servers: dict[str, dict],
+        *,
+        timeout_s: float = 15.0,
+        sequential: bool = False,
+    ) -> dict[str, bool]:
+        """
+        Async connect to multiple MCP servers with timeouts.
+
+        Args:
+            servers: Dict mapping server names to config dicts
+            timeout_s: Default per-server connect timeout
+            sequential: If True, connect one-by-one (useful to reduce load)
+
+        Returns:
+            Dict mapping server names to connection success status (True/False)
+        """
+
+        async def connect_one(name: str, config_dict: dict) -> tuple[str, bool]:
+            config = ServerConfig(**config_dict)
+            per_server_timeout = config.timeout_s if config.timeout_s is not None else timeout_s
+            try:
+                ok = await asyncio.wait_for(self._connect_server(name, config), timeout=per_server_timeout)
+                return name, ok
+            except asyncio.TimeoutError:
+                logger.warning("Timed out connecting to %s after %.1fs", name, per_server_timeout)
+                # Best-effort cleanup (covers partial initialization).
+                if name in self._exit_stacks:
+                    await self._exit_stacks[name].aclose()
+                    del self._exit_stacks[name]
+                if name in self._errlogs:
+                    try:
+                        self._errlogs[name].close()
+                    except Exception:
+                        pass
+                    del self._errlogs[name]
+                return name, False
+            except Exception as e:
+                logger.warning("Failed to connect to %s: %s", name, e)
+                return name, False
+
+        results: dict[str, bool] = {}
+
+        if sequential:
+            for name, config_dict in servers.items():
+                n, ok = await connect_one(name, config_dict)
+                results[n] = ok
+            return results
+
+        tasks = [connect_one(name, config_dict) for name, config_dict in servers.items()]
+        for coro in asyncio.as_completed(tasks):
+            name, ok = await coro
+            results[name] = ok
+        return results
+
     def connect(self, servers: dict[str, dict]) -> dict[str, bool]:
         """
         Connect to multiple MCP servers.
@@ -156,15 +231,7 @@ class MCPClientWrapper:
         Returns:
             Dict mapping server names to connection success status
         """
-
-        async def connect_all():
-            results = {}
-            for name, config_dict in servers.items():
-                config = ServerConfig(**config_dict)
-                results[name] = await self._connect_server(name, config)
-            return results
-
-        return self._run_async(connect_all())
+        return self._run_async(self.connect_async(servers))
 
     def discover_tools(self) -> dict[str, list[str]]:
         """
@@ -181,30 +248,37 @@ class MCPClientWrapper:
                     result = await session.list_tools()
                     tools_by_server[name] = [tool.name for tool in result.tools]
                 except Exception as e:
-                    print(f"Failed to list tools from {name}: {e}")
+                    logger.warning("Failed to list tools from %s: %s", name, e)
                     tools_by_server[name] = []
             return tools_by_server
 
         return self._run_async(list_all_tools())
 
-    def _invoke_tool(self, server: str, tool: str, **kwargs) -> Any:
+    def _invoke_tool(self, server: str, tool: str, timeout: float = 60.0, **kwargs) -> Any:
         """
         Invoke a tool on a specific server.
 
         Args:
             server: Server name
             tool: Tool name
+            timeout: Timeout in seconds for the tool call (default: 60s)
             **kwargs: Tool arguments
 
         Returns:
             Tool result (parsed from content)
+
+        Raises:
+            asyncio.TimeoutError: If the tool call exceeds the timeout
         """
         if server not in self._sessions:
             raise ValueError(f"Server '{server}' not connected")
 
         async def call_tool():
             session = self._sessions[server]
-            result = await session.call_tool(tool, arguments=kwargs)
+            result = await asyncio.wait_for(
+                session.call_tool(tool, arguments=kwargs),
+                timeout=timeout
+            )
 
             # Parse result from content
             if result.content:

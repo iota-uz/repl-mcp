@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "github": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
@@ -8,15 +9,14 @@
       }
     },
     "python-repl": {
+      "type": "stdio",
       "command": "uv",
       "args": [
         "run",
         "repl-mcp",
         "--transport",
-        "sse",
-        "--no-autoconnect"
-      ],
-      "url": "http://localhost:8000/sse"
+        "stdio"
+      ]
     }
   }
 }

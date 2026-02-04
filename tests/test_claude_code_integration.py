@@ -6,7 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 import pytest
-from mcp import ClientSession
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
 
@@ -91,70 +92,93 @@ class TestClaudeCodeIntegration:
         if not python_repl:
             pytest.skip("python-repl not configured in .mcp.json")
 
-        # Start server exactly as Claude Code would
-        process = subprocess.Popen(
-            [python_repl["command"]] + python_repl["args"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(PROJECT_ROOT),  # Claude Code sets cwd to where .mcp.json is
-            text=True,
-        )
+        # Support both SSE-style configs (url) and stdio-style configs (command/args).
+        if python_repl.get("url"):
+            # Start server exactly as Claude Code would (subprocess) and connect over SSE.
+            process = subprocess.Popen(
+                [python_repl["command"]] + python_repl["args"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(PROJECT_ROOT),  # Claude Code sets cwd to where .mcp.json is
+                text=True,
+            )
 
-        try:
-            # Wait for readiness
-            start_time = time.time()
-            max_wait = 25  # Allow more time for autoconnect
+            try:
+                # Wait for readiness
+                start_time = time.time()
+                max_wait = 25
 
-            last_error = None
-            while time.time() - start_time < max_wait:
-                if process.poll() is not None:
+                last_error = None
+                while time.time() - start_time < max_wait:
+                    if process.poll() is not None:
+                        stdout, stderr = process.communicate()
+                        pytest.fail(f"Server crashed:\nSTDOUT: {stdout[:500]}\nSTDERR: {stderr[:500]}")
+
+                    try:
+                        transport = sse_client(python_repl["url"])
+                        async with transport as (read, write):
+                            async with ClientSession(read, write) as session:
+                                await session.initialize()
+
+                                startup_time = time.time() - start_time
+                                print(f"✓ Server ready in {startup_time:.2f}s")
+
+                                tools = await session.list_tools()
+                                tool_names = [t.name for t in tools.tools]
+                                assert "execute_python" in tool_names
+                                assert "list_connected_servers" in tool_names
+
+                                result = await session.call_tool(
+                                    "execute_python",
+                                    arguments={"code": "import sys; sys.version"},
+                                )
+                                assert "success" in str(result.content).lower()
+
+                                return
+                    except Exception as e:
+                        last_error = str(e)
+                        await asyncio.sleep(0.5)
+
+                if process.poll() is None:
+                    process.terminate()
+                    stdout, stderr = process.communicate(timeout=2)
+                    pytest.fail(
+                        f"Server did not become ready in {max_wait}s\n"
+                        f"Last error: {last_error}\nSTDERR: {stderr[:500]}"
+                    )
+                else:
                     stdout, stderr = process.communicate()
-                    pytest.fail(f"Server crashed:\nSTDOUT: {stdout[:500]}\nSTDERR: {stderr[:500]}")
+                    pytest.fail(f"Server exited during test\nSTDOUT: {stdout[:500]}\nSTDERR: {stderr[:500]}")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+        else:
+            # Claude Code's default is stdio: spawn and connect over stdio.
+            server_params = StdioServerParameters(
+                command=python_repl["command"],
+                args=python_repl.get("args", []),
+                env=None,
+                cwd=PROJECT_ROOT,
+            )
+            transport = stdio_client(server_params)
+            async with transport as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
 
-                try:
-                    transport = sse_client(python_repl["url"])
-                    async with transport as (read, write):
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
+                    tools = await session.list_tools()
+                    tool_names = [t.name for t in tools.tools]
+                    assert "execute_python" in tool_names
+                    assert "list_connected_servers" in tool_names
 
-                            startup_time = time.time() - start_time
-                            print(f"✓ Server ready in {startup_time:.2f}s")
-
-                            # Verify tools available
-                            tools = await session.list_tools()
-                            tool_names = [t.name for t in tools.tools]
-                            assert "execute_python" in tool_names
-                            assert "list_connected_servers" in tool_names
-
-                            # Test execution
-                            result = await session.call_tool(
-                                "execute_python",
-                                arguments={"code": "import sys; sys.version"}
-                            )
-                            assert "success" in str(result.content).lower()
-
-                            return  # Test passed
-                except Exception as e:
-                    last_error = str(e)
-                    await asyncio.sleep(0.5)
-
-            # If we get here, timeout occurred
-            # Check if process is still alive and get its output
-            if process.poll() is None:
-                # Still running but not responding
-                process.terminate()
-                stdout, stderr = process.communicate(timeout=2)
-                pytest.fail(f"Server did not become ready in {max_wait}s\nLast error: {last_error}\nSTDERR: {stderr[:500]}")
-            else:
-                stdout, stderr = process.communicate()
-                pytest.fail(f"Server exited during test\nSTDOUT: {stdout[:500]}\nSTDERR: {stderr[:500]}")
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                    result = await session.call_tool(
+                        "execute_python",
+                        arguments={"code": "import sys; sys.version"},
+                    )
+                    assert "success" in str(result.content).lower()
 
     def test_port_conflict_detection(self, clean_environment):
         """Test that server detects port conflicts and fails gracefully."""
@@ -249,3 +273,44 @@ class TestClaudeCodeIntegration:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+    @pytest.mark.asyncio
+    async def test_stdio_autoconnect_does_not_pollute_stdout(self, tmp_path, clean_environment):
+        """Test that autoconnect doesn't corrupt stdio JSON-RPC stream."""
+        # Create a config with an intentionally failing server to exercise autoconnect paths.
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "bad-server": {
+                            "type": "stdio",
+                            "command": "false",
+                            "args": [],
+                            "timeout_s": 1.0,
+                        }
+                    }
+                }
+            )
+        )
+
+        server_params = StdioServerParameters(
+            command="uv",
+            args=["run", "repl-mcp", "--transport", "stdio"],
+            env=None,
+            cwd=tmp_path,
+        )
+        transport = stdio_client(server_params)
+        async with transport as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # If stdout is polluted, initialize() or list_tools() typically fails.
+                tools = await session.list_tools()
+                tool_names = [t.name for t in tools.tools]
+                assert "execute_python" in tool_names
+
+                result = await session.call_tool(
+                    "execute_python",
+                    arguments={"code": "2+2"},
+                )
+                assert "4" in str(result.content)
