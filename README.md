@@ -23,6 +23,12 @@ claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp
 
 That's it. The REPL is now available in Claude Code.
 
+### Codex CLI
+
+```bash
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp repl-mcp
+```
+
 ### Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
