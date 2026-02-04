@@ -19,13 +19,48 @@ from ..models import (
 
 
 class GitUtils(REPLUtility):
-    """Git repository utilities for code analysis.
+    """
+    Git repository utilities for structured code analysis.
 
-    Example usage in REPL:
-        git.log(n=5)
-        git.status()
-        git.diff("main", "feature")
-        git.blame("src/main.py")
+    All methods return Pydantic models for easy data access.
+
+    Methods:
+        log(n=10, path=None, since=None) -> list[CommitInfo]
+            Get recent commits, optionally filtered by path or date
+        diff(from_ref="HEAD", to_ref=None) -> list[FileDiff]
+            Get file changes between refs (staged changes if to_ref is None)
+        blame(path) -> list[BlameLine]
+            Get line-by-line blame for a file
+        status() -> GitStatus
+            Get current repository status (branch, staged, unstaged, untracked)
+        show(ref) -> CommitInfo
+            Get details of a specific commit
+        branches() -> list[BranchInfo]
+            List all branches
+        tags(n=20) -> list[TagInfo]
+            List recent tags
+        file_history(path, n=10) -> list[CommitInfo]
+            Get commit history for a specific file
+
+    Examples:
+        >>> commits = git.log(n=5)
+        >>> for c in commits:
+        ...     print(f"{c.short_hash}: {c.message}")
+
+        >>> status = git.status()
+        >>> print(f"On branch: {status.branch}")
+        >>> print(f"Staged files: {status.staged}")
+
+        >>> blame = git.blame("src/main.py")
+        >>> for line in blame[:5]:
+        ...     print(f"{line.line_num}: {line.author}: {line.content}")
+
+        >>> diffs = git.diff("main", "HEAD")
+        >>> for d in diffs:
+        ...     print(f"{d.path}: +{d.additions} -{d.deletions}")
+
+    Note:
+        All operations are read-only. No commit/push methods are provided.
     """
 
     def __init__(self, repo_path: Union[str, Path]):

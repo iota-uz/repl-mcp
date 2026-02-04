@@ -8,15 +8,51 @@ from .base import REPLUtility, PathEscapeError, WriteDisabledError, WorkspaceErr
 
 
 class Workspace(REPLUtility):
-    """Sandboxed file access within a workspace root directory.
+    """
+    Sandboxed file access within workspace root.
 
-    All paths are resolved relative to the workspace root, and path traversal
-    attacks (e.g., "../../../etc/passwd") are blocked.
+    All paths are relative to workspace root and cannot escape via .. or symlinks.
 
-    Example usage in REPL:
-        workspace.read("src/main.py")
-        workspace.glob("**/*.py")
-        workspace.write("output.json", json.dumps(data))
+    Methods:
+        read(path) -> str           Read file contents
+        read_bytes(path) -> bytes   Read file as bytes
+        read_lines(path) -> list    Read file as list of lines
+        write(path, content)        Write file contents
+        write_bytes(path, content)  Write bytes to file
+        append(path, content)       Append to file
+        glob(pattern) -> list[str]  Find files matching glob pattern
+        exists(path) -> bool        Check if path exists
+        is_file(path) -> bool       Check if path is a file
+        is_dir(path) -> bool        Check if path is a directory
+        listdir(path) -> list[str]  List directory contents
+        stat(path) -> dict          Get file statistics
+        mkdir(path)                 Create directory
+        remove(path)                Remove file
+        rmdir(path)                 Remove directory
+        copy(src, dst)              Copy file
+        move(src, dst)              Move/rename file
+        search(pattern, path)       Search for pattern in files
+        tree(path, max_depth)       Show directory tree
+
+    Examples:
+        >>> workspace.read("src/main.py")
+        '#!/usr/bin/env python\\n...'
+
+        >>> workspace.glob("**/*.py")
+        ['src/main.py', 'src/utils.py', 'tests/test_main.py']
+
+        >>> workspace.exists("config.json")
+        True
+
+        >>> workspace.write("output.txt", "Hello, World!")
+
+        >>> for result in workspace.search("TODO", "src/"):
+        ...     print(f"{result['file']}:{result['line_num']}: {result['line']}")
+
+    Security:
+        - Path traversal (../) is blocked
+        - Symlinks escaping workspace are blocked
+        - Write operations can be disabled via allow_write=False
     """
 
     def __init__(self, root: Union[str, Path], allow_write: bool = True):

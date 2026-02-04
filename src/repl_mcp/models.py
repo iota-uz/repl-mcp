@@ -1,8 +1,35 @@
 """Data models for REPL MCP server."""
 
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 from pydantic import BaseModel, Field, ConfigDict
+
+
+class TruncationInfo(BaseModel):
+    """Metadata about truncated output."""
+
+    truncated: bool = Field(description="Whether content was truncated")
+    original_size: int = Field(description="Original size in characters")
+    truncated_size: int = Field(description="Size after truncation")
+    truncation_type: Literal["hard", "smart"] = Field(
+        default="hard",
+        description="'hard' = simple cutoff, 'smart' = attempt to preserve structure"
+    )
+
+
+class WarningInfo(BaseModel):
+    """Non-fatal execution warnings."""
+
+    category: str = Field(description="Warning category (e.g., 'large_output', 'slow_execution')")
+    message: str = Field(description="Human-readable warning message")
+    suggestion: Optional[str] = Field(
+        default=None,
+        description="Actionable suggestion to address the warning"
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional context (e.g., actual_size, threshold)"
+    )
 
 
 class ExceptionInfo(BaseModel):
@@ -12,17 +39,59 @@ class ExceptionInfo(BaseModel):
     message: str = Field(description="Exception message")
     traceback: str = Field(description="Full traceback string")
 
+    # Python 3.10+ style hints
+    hints: list[str] = Field(
+        default_factory=list,
+        description="Helpful hints for fixing this error (e.g., 'Did you mean workspace.read()?')"
+    )
+    similar_names: list[str] = Field(
+        default_factory=list,
+        description="For NameError/AttributeError: suggested similar names"
+    )
+    context_line: Optional[str] = Field(
+        default=None,
+        description="The line of code that caused the error"
+    )
+
 
 class ExecutionResult(BaseModel):
     """Result of executing Python code in the REPL."""
 
     success: bool = Field(description="Whether execution succeeded without exceptions")
+
+    # Output fields with truncation metadata
     stdout: str = Field(default="", description="Standard output captured during execution")
+    stdout_info: Optional[TruncationInfo] = Field(
+        default=None,
+        description="Truncation metadata for stdout"
+    )
+
     stderr: str = Field(default="", description="Standard error captured during execution")
+    stderr_info: Optional[TruncationInfo] = Field(
+        default=None,
+        description="Truncation metadata for stderr"
+    )
+
     return_value: Optional[str] = Field(default=None, description="String representation of return value")
+    return_value_info: Optional[TruncationInfo] = Field(
+        default=None,
+        description="Truncation metadata for return value"
+    )
+
     exception: Optional[ExceptionInfo] = Field(default=None, description="Exception info if execution failed")
     execution_time_ms: float = Field(description="Execution time in milliseconds")
+
     namespace_vars: dict[str, str] = Field(default_factory=dict, description="Current namespace variables")
+    namespace_vars_info: dict[str, TruncationInfo] = Field(
+        default_factory=dict,
+        description="Truncation info for each namespace variable"
+    )
+
+    # Warnings system
+    warnings: list[WarningInfo] = Field(
+        default_factory=list,
+        description="Non-fatal warnings about execution"
+    )
 
 
 class ServerConfig(BaseModel):

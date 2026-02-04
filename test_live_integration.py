@@ -91,7 +91,7 @@ async def test_repl_server():
                 tool_names = [tool.name for tool in tools_result.tools]
                 print(f"   Available tools: {', '.join(tool_names)}")
 
-                expected_tools = ["execute_python", "list_namespace_vars", "list_connected_servers"]
+                expected_tools = ["execute_python"]
                 for tool in expected_tools:
                     if tool in tool_names:
                         print(f"   ✅ {tool}")
@@ -134,12 +134,15 @@ async def test_repl_server():
                     else:
                         print("   ❌ State not persisted")
 
-                # Test 3: List namespace
-                result = await session.call_tool("list_namespace_vars", arguments={})
+                # Test 3: List namespace using %whos magic
+                result = await session.call_tool(
+                    "execute_python",
+                    arguments={"code": "%whos"}
+                )
 
                 if result.content:
                     content = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
-                    print(f"   Test 3 - List namespace:")
+                    print(f"   Test 3 - List namespace (%whos):")
                     print(f"   {content[:200]}")
 
                     if "x" in content and "y" in content:

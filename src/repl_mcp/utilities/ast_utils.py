@@ -19,13 +19,49 @@ from ..models import (
 
 
 class ASTUtils(REPLUtility):
-    """AST-based code analysis utilities for Python.
+    """
+    Python-specific AST analysis using built-in ast module.
 
-    Example usage in REPL:
-        ast_utils.find_function_calls("src/", "deprecated_api")
-        ast_utils.find_function_definitions("src/")
-        ast_utils.find_imports("src/main.py")
-        ast_utils.dependency_graph("src/")
+    All methods return Pydantic models with file, line, and context info.
+
+    Methods:
+        find_functions(path, name_pattern=None, recursive=True) -> list[FunctionDef]
+            Find function definitions, optionally matching name pattern
+        find_classes(path, name_pattern=None, recursive=True) -> list[ClassDef]
+            Find class definitions, optionally matching name pattern
+        find_calls(path, name, recursive=True) -> list[CallSite]
+            Find all calls to a specific function
+        find_imports(path, recursive=True) -> list[ImportInfo]
+            Find all import statements
+        find_usages(path, name, recursive=True) -> list[UsageInfo]
+            Find all usages of a name (variables, function calls, etc.)
+        complexity(path) -> ComplexityMetrics
+            Get code complexity metrics for a file
+        dependency_graph(path) -> DependencyGraph
+            Build import dependency graph
+
+    Examples:
+        >>> # Find all functions in a directory
+        >>> funcs = ast_utils.find_functions("src/")
+        >>> for f in funcs:
+        ...     print(f"{f.file}:{f.line} def {f.name}({', '.join(f.params)})")
+
+        >>> # Find calls to a deprecated function
+        >>> calls = ast_utils.find_calls("src/", "old_api")
+        >>> for c in calls:
+        ...     print(f"{c.file}:{c.line}: {c.full_call}")
+
+        >>> # Find all imports
+        >>> imports = ast_utils.find_imports("src/main.py")
+        >>> for imp in imports:
+        ...     print(f"import {imp.module}")
+
+        >>> # Get complexity metrics
+        >>> metrics = ast_utils.complexity("src/main.py")
+        >>> print(f"Functions: {metrics.functions}, Nesting: {metrics.max_nesting_depth}")
+
+    Note:
+        For multi-language analysis, use the 'code' utility instead (tree-sitter based).
     """
 
     def __init__(self, workspace: Workspace):

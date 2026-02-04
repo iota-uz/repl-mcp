@@ -50,7 +50,7 @@ class ToolsContainer:
 
 
 class MCPClientWrapper:
-    """Synchronous wrapper for MCP client with dynamic tool access."""
+    """Synchronous wrapper for MCP client with dynamic tool access and Python-native introspection."""
 
     def __init__(self):
         self._sessions: dict[str, ClientSession] = {}
@@ -58,6 +58,24 @@ class MCPClientWrapper:
         self._errlogs: dict[str, Any] = {}  # Track errlog file handles
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.tools = ToolsContainer(self)
+
+    @property
+    def servers(self) -> list[str]:
+        """
+        List connected server names (Python property, not tool call).
+
+        Returns:
+            List of connected server names
+
+        Example:
+            >>> mcp.servers
+            ['github', 'playwright']
+        """
+        return list(self._sessions.keys())
+
+    def __dir__(self):
+        """Support dir(mcp) introspection."""
+        return ['tools', 'servers', 'list_tools', 'help', 'discover_tools']
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Get or create event loop."""
@@ -233,26 +251,121 @@ class MCPClientWrapper:
         """
         return self._run_async(self.connect_async(servers))
 
-    def discover_tools(self) -> dict[str, list[str]]:
+    def list_tools(self, server: Optional[str] = None) -> dict[str, list[str]]:
         """
-        List all available tools from connected servers.
+        List available tools from connected servers.
+
+        Args:
+            server: Specific server name, or None for all servers
 
         Returns:
-            Dict mapping server names to lists of tool names
+            Dict mapping server names to tool lists
+
+        Examples:
+            >>> mcp.list_tools()
+            {'github': ['create_issue', 'list_issues', ...], 'playwright': [...]}
+
+            >>> mcp.list_tools('github')
+            {'github': ['create_issue', 'list_issues', ...]}
         """
 
-        async def list_all_tools():
+        async def get_tools():
             tools_by_server = {}
-            for name, session in self._sessions.items():
+            servers_to_query = [server] if server else list(self._sessions.keys())
+
+            for name in servers_to_query:
+                if name not in self._sessions:
+                    logger.warning("Server %s not connected", name)
+                    continue
+
                 try:
-                    result = await session.list_tools()
+                    result = await self._sessions[name].list_tools()
                     tools_by_server[name] = [tool.name for tool in result.tools]
                 except Exception as e:
                     logger.warning("Failed to list tools from %s: %s", name, e)
                     tools_by_server[name] = []
             return tools_by_server
 
-        return self._run_async(list_all_tools())
+        return self._run_async(get_tools())
+
+    def discover_tools(self) -> dict[str, list[str]]:
+        """
+        List all available tools from connected servers.
+
+        Deprecated: Use list_tools() instead for Python-native introspection.
+
+        Returns:
+            Dict mapping server names to lists of tool names
+        """
+        return self.list_tools()
+
+    def help(self, server: Optional[str] = None, tool: Optional[str] = None) -> str:
+        """
+        Show help for MCP servers and tools.
+
+        Args:
+            server: Server name, or None to show all servers
+            tool: Tool name (requires server), or None to show all tools
+
+        Returns:
+            Help text string
+
+        Usage:
+            >>> print(mcp.help())              # Show all servers
+            >>> print(mcp.help('github'))       # Show github tools
+            >>> print(mcp.help('github', 'create_issue'))  # Show specific tool
+        """
+        if server is None:
+            # Show all servers
+            servers = list(self._sessions.keys())
+            if not servers:
+                return "No MCP servers connected"
+
+            output = "Connected MCP servers:\n"
+            tool_list = self.list_tools()
+            for srv in servers:
+                tools = tool_list.get(srv, [])
+                output += f"  {srv} ({len(tools)} tools)\n"
+            output += "\nUse mcp.help('server') to see tools for a specific server"
+            return output
+
+        elif tool is None:
+            # Show all tools for a server
+            if server not in self._sessions:
+                return f"Server '{server}' not connected"
+
+            tool_list = self.list_tools(server)
+            tools = tool_list.get(server, [])
+
+            if not tools:
+                return f"No tools available from server '{server}'"
+
+            output = f"Tools from '{server}':\n"
+            for t in tools:
+                output += f"  - {t}\n"
+            output += f"\nUse mcp.help('{server}', 'tool_name') for details on a specific tool"
+            output += f"\nOr: help(mcp.tools.{server}.tool_name)"
+            return output
+
+        else:
+            # Show specific tool help
+            if server not in self._sessions:
+                return f"Server '{server}' not connected"
+
+            # Get tool schema
+            async def get_tool_schema():
+                try:
+                    result = await self._sessions[server].list_tools()
+                    for t in result.tools:
+                        if t.name == tool:
+                            desc = t.description or "No description available"
+                            schema = t.inputSchema if hasattr(t, 'inputSchema') else {}
+                            return f"{server}.{tool}:\n  {desc}\n\n  Schema: {schema}"
+                    return f"Tool '{tool}' not found in server '{server}'"
+                except Exception as e:
+                    return f"Error getting tool info: {e}"
+
+            return self._run_async(get_tool_schema())
 
     def _invoke_tool(self, server: str, tool: str, timeout: float = 60.0, **kwargs) -> Any:
         """

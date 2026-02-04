@@ -99,13 +99,11 @@ uv run repl-mcp --transport stdio
 
 ### 3. Use from Claude Code
 
-The server exposes these MCP tools:
+The server exposes one MCP tool:
 
-- `execute_python(code: str, reset: bool = False)` - Execute Python code
-- `list_namespace_vars()` - List current namespace variables
-- `connect_mcp_servers(servers: dict)` - Connect to additional MCP servers at runtime
-- `list_connected_servers()` - List connected servers and their tools
-- `disconnect_mcp_server(server: str | None)` - Disconnect from server(s)
+- `execute_python(code, reset=False, inject=None)` - Execute Python in a persistent REPL
+
+Inside the REPL, use `%help` for documentation, `object?` for quick help, and `%who` to list variables.
 
 ## Usage Examples
 
@@ -271,11 +269,12 @@ Claude ←→ FastMCP Server ←→ REPL Engine ←→ MCP Client Wrapper ←→
 
 ### execute_python
 
-Execute Python code in persistent REPL environment.
+Execute Python code in a persistent REPL environment with pre-injected utilities.
 
 **Parameters:**
 - `code` (str): Python code to execute
 - `reset` (bool, optional): Reset namespace before execution (default: False)
+- `inject` (dict, optional): Variables to inject into namespace
 
 **Returns:**
 ```python
@@ -287,71 +286,26 @@ Execute Python code in persistent REPL environment.
     "exception": {
         "type": str,
         "message": str,
-        "traceback": str
+        "traceback": str,
+        "hints": list[str],         # Helpful suggestions
+        "similar_names": list[str]  # For typo detection
     } | None,
     "execution_time_ms": float,
-    "namespace_vars": dict[str, str]
+    "namespace_vars": dict[str, str],
+    "warnings": list[{
+        "category": str,
+        "message": str,
+        "suggestion": str
+    }]
 }
 ```
 
-### connect_mcp_servers
-
-Connect to external MCP servers at runtime.
-
-**Parameters:**
-```python
-servers: dict = {
-    "server_name": {
-        "command": str,        # For stdio transport
-        "args": list[str],     # Optional command args
-        "url": str,            # For HTTP/SSE transport
-        "env": dict[str, str]  # Optional environment variables
-    }
-}
-```
-
-**Returns:**
-```python
-{
-    "server_name": bool  # True if connected successfully
-}
-```
-
-### list_connected_servers
-
-List all connected MCP servers and their tools.
-
-**Returns:**
-```python
-{
-    "server_name": ["tool1", "tool2", ...]
-}
-```
-
-### list_namespace_vars
-
-List variables in current REPL namespace.
-
-**Returns:**
-```python
-{
-    "variable_name": "repr(value)"  # Truncated to 100 chars
-}
-```
-
-### disconnect_mcp_server
-
-Disconnect from MCP server(s).
-
-**Parameters:**
-- `server` (str | None): Server name to disconnect, or None to disconnect all
-
-**Returns:**
-```python
-{
-    "status": str  # Status message
-}
-```
+**REPL Features:**
+- `%help` - Full documentation
+- `object?` - Quick docstring (IPython-style)
+- `%who` / `%whos` - List variables
+- `%history` - Execution history
+- `%reset` - Clear namespace
 
 ## Security Warning
 

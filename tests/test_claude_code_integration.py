@@ -126,7 +126,6 @@ class TestClaudeCodeIntegration:
                                 tools = await session.list_tools()
                                 tool_names = [t.name for t in tools.tools]
                                 assert "execute_python" in tool_names
-                                assert "list_connected_servers" in tool_names
 
                                 result = await session.call_tool(
                                     "execute_python",
@@ -172,7 +171,6 @@ class TestClaudeCodeIntegration:
                     tools = await session.list_tools()
                     tool_names = [t.name for t in tools.tools]
                     assert "execute_python" in tool_names
-                    assert "list_connected_servers" in tool_names
 
                     result = await session.call_tool(
                         "execute_python",

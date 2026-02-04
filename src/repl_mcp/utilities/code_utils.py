@@ -354,18 +354,51 @@ CALL_QUERIES = {
 
 
 class CodeUtils(REPLUtility):
-    """Multi-language code analysis using tree-sitter.
+    """
+    Multi-language code analysis using tree-sitter (100+ languages).
 
-    Supports 100+ languages including Python, JavaScript, TypeScript, Go, Rust,
-    Java, C/C++, Ruby, and many more.
+    Unlike ast_utils (Python-only), code works with any language:
+    JavaScript, TypeScript, Go, Rust, Java, C/C++, Ruby, Kotlin, Swift, etc.
 
-    Example usage in REPL:
-        code.find_functions("src/")                    # Auto-detect language
-        code.find_functions("src/", language="go")     # Explicit language
-        code.find_classes("src/**/*.ts")               # TypeScript only
-        code.find_imports("src/main.rs")               # Rust imports
-        code.find_calls("src/", "fetch")               # Find function calls
-        code.supported_languages()                     # List all languages
+    Methods:
+        find_functions(path, language=None, name_pattern=None) -> list[FunctionDef]
+            Find function/method definitions across languages
+        find_classes(path, language=None, name_pattern=None) -> list[ClassDef]
+            Find class/struct/interface definitions
+        find_imports(path, language=None) -> list[ImportInfo]
+            Find import/require/use statements
+        find_calls(path, function_name, include_context=False) -> list[CallSite]
+            Find all calls to a specific function
+        supported_languages() -> list[str]
+            List all supported language names
+
+    Examples:
+        >>> # Find all functions in any language
+        >>> for f in code.find_functions("src/"):
+        ...     print(f"{f.file}:{f.line} {f.name}")
+
+        >>> # Find handler functions (regex pattern)
+        >>> for f in code.find_functions(".", name_pattern="^handle"):
+        ...     print(f"{f.file}:{f.line} {f.name}")
+
+        >>> # Find classes in TypeScript files
+        >>> for c in code.find_classes("src/", language="typescript"):
+        ...     print(f"{c.name}: {c.methods}")
+
+        >>> # Find calls to a function
+        >>> for call in code.find_calls("src/", "fetch"):
+        ...     print(f"{call.file}:{call.line}")
+
+        >>> # Check supported languages
+        >>> code.supported_languages()
+        ['python', 'javascript', 'typescript', 'go', 'rust', ...]
+
+    Language Detection:
+        Language is auto-detected from file extension.
+        Override with language= for ambiguous cases.
+
+    Supported Extensions:
+        .py, .js/.ts/.tsx, .go, .rs, .java, .c/.cpp, .rb, .php, .cs, .kt, .swift, ...
     """
 
     def __init__(self, workspace: Workspace):

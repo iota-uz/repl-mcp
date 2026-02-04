@@ -187,180 +187,35 @@ def create_server(
         """
         Execute Python in persistent REPL with codebase utilities.
 
-        WHEN TO USE (vs Read/Grep/Bash):
-        - Batch operations across many files
-        - Combining data from multiple sources (git + AST + files)
-        - Complex transformations, filtering, or analysis
-        - When you need loops or computation over results
+        Use for batch operations, combining data sources, or complex analysis.
+        State persists between calls. Use %help inside for full documentation.
 
-        PRE-INJECTED UTILITIES:
+        Pre-injected utilities:
+          workspace  - File ops: .read(), .write(), .glob(), .exists()
+          git        - Git ops: .log(), .diff(), .blame(), .status()
+          ast_utils  - Python AST: .find_functions(), .find_classes(), .find_calls()
+          code       - Multi-lang (100+ languages): .find_functions(), .find_classes()
+          mcp        - MCP tools: .tools.<server>.<method>(), .servers, .help()
 
-        workspace - Sandboxed file access
-          .read(path) -> str
-          .write(path, content) -> None
-          .glob(pattern) -> list[str]         # "**/*.py", "src/**/*.ts"
-          .exists(path) -> bool
-          .listdir(path=".") -> list[str]
-          .mkdir(path) -> None
-          .remove(path) -> None
-
-        git - Repository operations (returns Pydantic models)
-          .log(n=10, path=None, since=None) -> list[CommitInfo]
-          .diff(from_ref="HEAD", to_ref=None) -> list[FileDiff]
-          .blame(path) -> list[BlameLine]
-          .status() -> GitStatus
-          .show(ref) -> CommitInfo
-          .branches() -> list[BranchInfo]
-          .file_history(path, n=10) -> list[CommitInfo]
-
-        ast_utils - Python-specific AST analysis
-          .find_functions(path, name_pattern=None, recursive=True) -> list[FunctionDef]
-          .find_classes(path, name_pattern=None, recursive=True) -> list[ClassDef]
-          .find_calls(path, name, recursive=True) -> list[CallSite]
-          .find_imports(path, recursive=True) -> list[ImportInfo]
-          .find_usages(path, name, recursive=True) -> list[UsageInfo]
-          .complexity(path) -> ComplexityMetrics
-
-        code - Multi-language analysis (tree-sitter, 100+ languages)
-          .find_functions(path, language=None, name_pattern=None) -> list[FunctionDef]
-          .find_classes(path, language=None, name_pattern=None) -> list[ClassDef]
-          .find_imports(path, language=None) -> list[ImportInfo]
-          .find_calls(path, function_name, include_context=False) -> list[CallSite]
-          .supported_languages() -> list[str]
-
-        mcp - Call other connected MCP servers
-          .tools.<server>.<method>(**kwargs)  # e.g., mcp.tools.github.create_issue(...)
-          .discover_tools() -> dict[str, list[str]]
-
-        EXAMPLES:
-
-        # Find all functions calling a deprecated API and who wrote them
-        for call in ast_utils.find_calls("src/", "deprecated_api"):
-            blame = git.blame(call.file)
-            author = blame[call.line - 1].author
-            print(f"{call.file}:{call.line} by {author}")
-
-        # Cross-language search for handler functions
-        for f in code.find_functions(".", name_pattern="^handle"):
-            print(f"{f.file}:{f.line} {f.name}")
-
-        # Find large files modified recently
-        for commit in git.log(n=20):
-            for path in commit.files_changed:
-                if workspace.exists(path):
-                    content = workspace.read(path)
-                    if len(content) > 1000:
-                        print(f"{path}: {len(content)} chars, last by {commit.author_name}")
-
-        # Batch create GitHub issues from TODOs
-        for f in workspace.glob("**/*.py"):
-            for i, line in enumerate(workspace.read(f).splitlines(), 1):
-                if "TODO:" in line:
-                    mcp.tools.github.create_issue(
-                        owner="org", repo="repo",
-                        title=f"TODO from {f}:{i}",
-                        body=line.strip()
-                    )
-
-        STATE: Variables persist across calls. Use reset=True to clear.
+        Quick reference:
+          %help       - Full documentation and examples
+          object?     - Show docstring (e.g., workspace?, git.log?)
+          %who        - List variables
+          %history    - Show execution history
 
         Args:
             code: Python code to execute
-            reset: Clear namespace before execution (keeps utilities)
-            timeout: Reserved for MCP tool call timeouts
-            inject: Variables to inject (e.g., inject={"data": [1,2,3]})
+            reset: Clear namespace (keeps utilities)
+            inject: Variables to inject (e.g., {"data": [1,2,3]})
 
         Returns:
-            success, stdout, stderr, return_value, exception, execution_time_ms, namespace_vars
+            success, stdout, return_value, exception, namespace_vars, warnings
         """
         if reset:
             repl_engine.reset_namespace()
 
         result = repl_engine.execute(code, timeout=timeout, inject=inject)
         return result.model_dump()
-
-    @mcp_server.tool()
-    def list_namespace_vars() -> dict[str, str]:
-        """
-        List all variables currently defined in the REPL namespace.
-
-        Returns:
-            Dict mapping variable names to their string representations (truncated to 100 chars)
-        """
-        return repl_engine.get_namespace_vars()
-
-    @mcp_server.tool()
-    def connect_mcp_servers(servers: dict) -> dict[str, bool]:
-        """
-        Connect to external MCP servers at runtime.
-
-        This allows dynamically adding new MCP servers without restarting the REPL server.
-        Once connected, tools from these servers are available via the 'mcp' object in
-        the REPL namespace.
-
-        Args:
-            servers: Dict mapping server names to server configurations.
-                    Each config should have:
-                    - command: Command to run (for stdio transport)
-                    - args: Command arguments (optional)
-                    - url: URL for HTTP/SSE transport (alternative to command)
-                    - env: Environment variables (optional)
-
-        Returns:
-            Dict mapping server names to connection success status (True/False)
-
-        Examples:
-            # Connect to GitHub MCP server
-            connect_mcp_servers(servers={
-                "github": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-github"],
-                    "env": {
-                        "GITHUB_TOKEN": "${GH_TOKEN}"
-                    }
-                }
-            })
-
-            # Connect via HTTP/SSE
-            connect_mcp_servers(servers={
-                "playwright": {
-                    "url": "http://localhost:3001/sse"
-                }
-            })
-        """
-        return mcp_wrapper.connect(servers)
-
-    @mcp_server.tool()
-    def list_connected_servers() -> dict[str, list[str]]:
-        """
-        List all currently connected MCP servers and their available tools.
-
-        Returns:
-            Dict mapping server names to lists of tool names
-
-        Example:
-            {
-                "github": ["create_issue", "list_issues", "search_code", ...],
-                "playwright": ["navigate", "screenshot", "fill_form", ...]
-            }
-        """
-        return mcp_wrapper.discover_tools()
-
-    @mcp_server.tool()
-    def disconnect_mcp_server(server: Optional[str] = None) -> dict:
-        """
-        Disconnect from MCP server(s).
-
-        Args:
-            server: Server name to disconnect, or None to disconnect all servers
-
-        Returns:
-            Dict with status message
-        """
-        mcp_wrapper.disconnect(server)
-        if server:
-            return {"status": f"Disconnected from {server}"}
-        return {"status": "Disconnected from all servers"}
 
     return mcp_server
 
