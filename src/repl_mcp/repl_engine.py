@@ -6,32 +6,99 @@ import time
 import asyncio
 import traceback
 from io import StringIO
+from pathlib import Path
 from typing import Optional, Any
 from contextlib import redirect_stdout, redirect_stderr
 
 from .models import ExecutionResult, ExceptionInfo
 
+# Reserved names that should be excluded from namespace output
+# and preserved during reset
+RESERVED_NAMES = frozenset({
+    "__builtins__", "__name__", "__doc__", "__package__",
+    "mcp", "workspace", "git", "ast_utils",
+})
+
 
 class REPLEngine:
     """Stateful Python REPL with persistent namespace and output capture."""
 
-    def __init__(self, mcp_wrapper: Optional[Any] = None):
+    def __init__(
+        self,
+        mcp_wrapper: Optional[Any] = None,
+        workspace_root: Optional[Path] = None,
+        enable_workspace: bool = True,
+        enable_git: bool = True,
+        enable_ast: bool = True,
+    ):
         """
-        Initialize REPL engine with persistent namespace.
+        Initialize REPL engine with persistent namespace and utilities.
 
         Args:
             mcp_wrapper: MCP client wrapper to inject into namespace
+            workspace_root: Root directory for workspace operations (default: cwd)
+            enable_workspace: Enable workspace file utilities
+            enable_git: Enable git utilities (if in a git repo)
+            enable_ast: Enable AST analysis utilities
         """
         self.globals: dict[str, Any] = {"__builtins__": __builtins__}
+        self.workspace_root = workspace_root or Path.cwd()
+
+        # Inject MCP wrapper
         if mcp_wrapper:
             self.globals["mcp"] = mcp_wrapper
 
-    def execute(self, code: str) -> ExecutionResult:
+        # Initialize workspace utilities
+        self._workspace = None
+        if enable_workspace:
+            try:
+                from .utilities.workspace import Workspace
+                self._workspace = Workspace(self.workspace_root)
+                self.globals["workspace"] = self._workspace
+            except Exception:
+                pass  # Workspace init failed, skip
+
+        # Initialize git utilities (Phase 2 - will be implemented later)
+        self._git = None
+        if enable_git:
+            try:
+                from .utilities.git_utils import GitUtils
+                self._git = GitUtils(self.workspace_root)
+                self.globals["git"] = self._git
+            except ImportError:
+                pass  # GitUtils not yet implemented
+            except Exception:
+                pass  # Not a git repo or other error
+
+        # Initialize AST utilities (Phase 3 - will be implemented later)
+        self._ast_utils = None
+        if enable_ast and self._workspace:
+            try:
+                from .utilities.ast_utils import ASTUtils
+                self._ast_utils = ASTUtils(self._workspace)
+                self.globals["ast_utils"] = self._ast_utils
+            except ImportError:
+                pass  # ASTUtils not yet implemented
+            except Exception:
+                pass  # AST init failed
+
+    def execute(
+        self,
+        code: str,
+        timeout: float = 120.0,
+        inject: Optional[dict] = None,
+    ) -> ExecutionResult:
         """
         Execute Python code in persistent namespace with output capture.
 
         Args:
             code: Python code to execute
+            timeout: Maximum execution time in seconds (default: 120s)
+                    Note: This timeout is enforced for MCP tool calls via the mcp object.
+                    Direct Python code execution cannot be easily interrupted due to
+                    Python's execution model.
+            inject: Optional dict of variables to inject into namespace before execution.
+                   These variables persist in the namespace after execution.
 
         Returns:
             ExecutionResult with captured output and execution status
@@ -42,6 +109,14 @@ class REPLEngine:
         return_value = None
         exception_info = None
         success = True
+
+        # Inject variables into namespace
+        if inject:
+            for key, value in inject.items():
+                if key in RESERVED_NAMES:
+                    # Don't allow overwriting reserved names
+                    continue
+                self.globals[key] = value
 
         try:
             # Compile code to check for syntax errors early
@@ -100,14 +175,8 @@ class REPLEngine:
         end_time = time.perf_counter()
         execution_time_ms = (end_time - start_time) * 1000
 
-        # Get namespace variables (exclude builtins and mcp)
-        namespace_vars = {}
-        for key, value in self.globals.items():
-            if key not in ("__builtins__", "mcp", "__name__", "__doc__", "__package__"):
-                try:
-                    namespace_vars[key] = repr(value)[:100]  # Limit length
-                except Exception:
-                    namespace_vars[key] = "<unprintable>"
+        # Get namespace variables (exclude reserved names)
+        namespace_vars = self._get_namespace_vars_dict()
 
         return ExecutionResult(
             success=success,
@@ -119,21 +188,30 @@ class REPLEngine:
             namespace_vars=namespace_vars,
         )
 
-    def reset_namespace(self) -> None:
-        """Reset namespace to initial state, preserving mcp object."""
-        mcp_obj = self.globals.get("mcp")
-        self.globals.clear()
-        self.globals["__builtins__"] = __builtins__
-        if mcp_obj:
-            self.globals["mcp"] = mcp_obj
-
-    def get_namespace_vars(self) -> dict[str, str]:
-        """Get current namespace variables (excluding builtins and mcp)."""
+    def _get_namespace_vars_dict(self) -> dict[str, str]:
+        """Get namespace variables as dict, excluding reserved names."""
         namespace_vars = {}
         for key, value in self.globals.items():
-            if key not in ("__builtins__", "mcp", "__name__", "__doc__", "__package__"):
+            if key not in RESERVED_NAMES:
                 try:
-                    namespace_vars[key] = repr(value)[:100]
+                    namespace_vars[key] = repr(value)[:100]  # Limit length
                 except Exception:
                     namespace_vars[key] = "<unprintable>"
         return namespace_vars
+
+    def reset_namespace(self) -> None:
+        """Reset namespace to initial state, preserving injected utilities."""
+        # Save utilities
+        saved = {}
+        for name in RESERVED_NAMES:
+            if name in self.globals and name != "__builtins__":
+                saved[name] = self.globals[name]
+
+        # Clear and restore
+        self.globals.clear()
+        self.globals["__builtins__"] = __builtins__
+        self.globals.update(saved)
+
+    def get_namespace_vars(self) -> dict[str, str]:
+        """Get current namespace variables (excluding reserved names)."""
+        return self._get_namespace_vars_dict()

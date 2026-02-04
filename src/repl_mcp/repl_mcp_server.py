@@ -1,10 +1,11 @@
 """FastMCP server exposing stateful Python REPL."""
 
+import asyncio
 import sys
 import json
 import argparse
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -20,23 +21,22 @@ repl_engine: Optional[REPLEngine] = None
 
 def setup_logging(transport: str, debug: bool = False) -> logging.Logger:
     """
-    Configure logging to avoid stdout pollution in SSE mode.
+    Configure logging to avoid stdout pollution.
 
     Args:
         transport: Transport type ('stdio' or 'sse')
-        debug: Enable debug logging to stdout even in SSE mode
+        debug: Enable debug logging (still logs to stderr)
 
     Returns:
         Logger instance
     """
-    if transport == "sse" and not debug:
-        # Log to stderr to keep stdout clean for SSE
-        handler = logging.StreamHandler(sys.stderr)
-    else:
-        handler = logging.StreamHandler(sys.stdout)
+    # Stdout must be kept clean for the stdio transport (it carries JSON-RPC).
+    # Logging to stderr is also safe for SSE mode.
+    handler = logging.StreamHandler(sys.stderr)
 
     handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
-    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, handlers=[handler], force=True)
     return logging.getLogger(__name__)
 
 
@@ -100,6 +100,7 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
     async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         """Lifespan context manager for the REPL MCP server."""
         global mcp_wrapper, repl_engine
+        autoconnect_task = None
 
         # --- STARTUP ---
         logger.info("Initializing REPL MCP server...")
@@ -107,8 +108,11 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
         # Initialize MCP wrapper
         mcp_wrapper = MCPClientWrapper()
 
-        # Initialize REPL engine
-        repl_engine = REPLEngine(mcp_wrapper=mcp_wrapper)
+        # Initialize REPL engine with workspace root
+        repl_engine = REPLEngine(
+            mcp_wrapper=mcp_wrapper,
+            workspace_root=Path.cwd(),
+        )
 
         # Auto-connect to configured servers
         if autoconnect_enabled:
@@ -118,19 +122,25 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
             servers = filter_servers(servers, exclude=["python-repl"])
 
             if servers:
-                logger.info(f"Auto-connecting to {len(servers)} MCP servers...")
-                results = mcp_wrapper.connect(servers)
-                # If connect returns a Task (because we're in async context), await it
-                if hasattr(results, '__await__'):
-                    results = await results
-                for name, success in results.items():
-                    status = "✓" if success else "✗"
-                    logger.info(f"  {status} {name}")
+                logger.info(f"Auto-connecting to {len(servers)} MCP servers (background)...")
+
+                async def do_connect():
+                    # Use sequential connects by default to reduce startup load.
+                    results = await mcp_wrapper.connect_async(servers, timeout_s=20.0, sequential=True)
+                    for name, success in results.items():
+                        status = "✓" if success else "✗"
+                        logger.info(f"  {status} {name}")
+
+                autoconnect_task = asyncio.create_task(do_connect())
 
         # Yield control - server runs here
         yield {}
 
         # --- SHUTDOWN ---
+        if autoconnect_task and not autoconnect_task.done():
+            autoconnect_task.cancel()
+            with suppress(BaseException):
+                await autoconnect_task
         try:
             logger.info("Shutting down REPL MCP server...")
         except ValueError:
@@ -168,17 +178,31 @@ def create_server(
 
     # Register tools
     @mcp_server.tool()
-    def execute_python(code: str, reset: bool = False) -> dict:
+    def execute_python(
+        code: str,
+        reset: bool = False,
+        timeout: float = 120.0,
+        inject: Optional[dict] = None
+    ) -> dict:
         """
         Execute Python code in persistent REPL environment.
 
         The REPL maintains state across executions. Variables, imports, and function
-        definitions persist between calls. A pre-injected 'mcp' object provides access
-        to connected MCP servers and their tools.
+        definitions persist between calls. Pre-injected objects provide access to:
+        - mcp: Connected MCP servers and their tools
+        - workspace: Sandboxed file access (read, write, glob, etc.)
+        - git: Git repository operations (log, diff, blame, status)
+        - ast_utils: Code analysis utilities (find functions, classes, imports)
+
+        MCP tool calls made within the code have a 60-second timeout by default.
+        You can override this per-call using the _timeout parameter.
 
         Args:
             code: Python code to execute
-            reset: If True, reset namespace before execution (preserves mcp object)
+            reset: If True, reset namespace before execution (preserves injected utilities)
+            timeout: Reserved for future use (currently only affects MCP tool calls)
+            inject: Optional dict of variables to inject into namespace before execution.
+                   Useful for passing data from Claude's context into the REPL.
 
         Returns:
             Dict containing:
@@ -195,14 +219,28 @@ def create_server(
             execute_python(code="x = 42")
             execute_python(code="print(x)")  # Output: 42
 
-            # Call MCP tools
+            # Use workspace utilities
             execute_python(code='''
-result = mcp.tools.github.create_issue(
-    owner="myuser",
-    repo="myrepo",
-    title="Test",
-    body="Created from REPL"
-)
+files = workspace.glob("**/*.py")
+print(f"Found {len(files)} Python files")
+            ''')
+
+            # Use git utilities
+            execute_python(code='''
+commits = git.log(n=5)
+for c in commits:
+    print(f"{c.short_hash}: {c.message}")
+            ''')
+
+            # Inject data from Claude's context
+            execute_python(
+                code="print(f'Processing {len(files)} files')",
+                inject={"files": ["a.py", "b.py", "c.py"]}
+            )
+
+            # Call MCP tools - default 60s timeout applies
+            execute_python(code='''
+result = mcp.tools.github.search_repositories(query="python repl")
 print(result)
             ''')
 
@@ -212,7 +250,7 @@ print(result)
         if reset:
             repl_engine.reset_namespace()
 
-        result = repl_engine.execute(code)
+        result = repl_engine.execute(code, timeout=timeout, inject=inject)
         return result.model_dump()
 
     @mcp_server.tool()
@@ -317,8 +355,11 @@ def initialize_server(autoconnect: bool = True, config_path: Path = Path(".mcp.j
     # Initialize MCP wrapper
     mcp_wrapper = MCPClientWrapper()
 
-    # Initialize REPL engine with mcp wrapper
-    repl_engine = REPLEngine(mcp_wrapper=mcp_wrapper)
+    # Initialize REPL engine with mcp wrapper and workspace root
+    repl_engine = REPLEngine(
+        mcp_wrapper=mcp_wrapper,
+        workspace_root=Path.cwd(),
+    )
 
     # Auto-connect to configured servers
     if autoconnect:
@@ -390,7 +431,7 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable debug logging to stdout (even in SSE mode)",
+        help="Enable debug logging (logs to stderr)",
     )
 
     args = parser.parse_args()
