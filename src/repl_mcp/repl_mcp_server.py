@@ -185,68 +185,93 @@ def create_server(
         inject: Optional[dict] = None
     ) -> dict:
         """
-        Execute Python code in persistent REPL environment.
+        Execute Python in persistent REPL with codebase utilities.
 
-        The REPL maintains state across executions. Variables, imports, and function
-        definitions persist between calls. Pre-injected objects provide access to:
-        - mcp: Connected MCP servers and their tools
-        - workspace: Sandboxed file access (read, write, glob, etc.)
-        - git: Git repository operations (log, diff, blame, status)
-        - ast_utils: Python code analysis (find functions, classes, imports)
-        - code: Multi-language code analysis via tree-sitter (100+ languages)
+        WHEN TO USE (vs Read/Grep/Bash):
+        - Batch operations across many files
+        - Combining data from multiple sources (git + AST + files)
+        - Complex transformations, filtering, or analysis
+        - When you need loops or computation over results
 
-        MCP tool calls made within the code have a 60-second timeout by default.
-        You can override this per-call using the _timeout parameter.
+        PRE-INJECTED UTILITIES:
+
+        workspace - Sandboxed file access
+          .read(path) -> str
+          .write(path, content) -> None
+          .glob(pattern) -> list[str]         # "**/*.py", "src/**/*.ts"
+          .exists(path) -> bool
+          .listdir(path=".") -> list[str]
+          .mkdir(path) -> None
+          .remove(path) -> None
+
+        git - Repository operations (returns Pydantic models)
+          .log(n=10, path=None, since=None) -> list[CommitInfo]
+          .diff(from_ref="HEAD", to_ref=None) -> list[FileDiff]
+          .blame(path) -> list[BlameLine]
+          .status() -> GitStatus
+          .show(ref) -> CommitInfo
+          .branches() -> list[BranchInfo]
+          .file_history(path, n=10) -> list[CommitInfo]
+
+        ast_utils - Python-specific AST analysis
+          .find_functions(path, name_pattern=None, recursive=True) -> list[FunctionDef]
+          .find_classes(path, name_pattern=None, recursive=True) -> list[ClassDef]
+          .find_calls(path, name, recursive=True) -> list[CallSite]
+          .find_imports(path, recursive=True) -> list[ImportInfo]
+          .find_usages(path, name, recursive=True) -> list[UsageInfo]
+          .complexity(path) -> ComplexityMetrics
+
+        code - Multi-language analysis (tree-sitter, 100+ languages)
+          .find_functions(path, language=None, name_pattern=None) -> list[FunctionDef]
+          .find_classes(path, language=None, name_pattern=None) -> list[ClassDef]
+          .find_imports(path, language=None) -> list[ImportInfo]
+          .find_calls(path, function_name, include_context=False) -> list[CallSite]
+          .supported_languages() -> list[str]
+
+        mcp - Call other connected MCP servers
+          .tools.<server>.<method>(**kwargs)  # e.g., mcp.tools.github.create_issue(...)
+          .discover_tools() -> dict[str, list[str]]
+
+        EXAMPLES:
+
+        # Find all functions calling a deprecated API and who wrote them
+        for call in ast_utils.find_calls("src/", "deprecated_api"):
+            blame = git.blame(call.file)
+            author = blame[call.line - 1].author
+            print(f"{call.file}:{call.line} by {author}")
+
+        # Cross-language search for handler functions
+        for f in code.find_functions(".", name_pattern="^handle"):
+            print(f"{f.file}:{f.line} {f.name}")
+
+        # Find large files modified recently
+        for commit in git.log(n=20):
+            for path in commit.files_changed:
+                if workspace.exists(path):
+                    content = workspace.read(path)
+                    if len(content) > 1000:
+                        print(f"{path}: {len(content)} chars, last by {commit.author_name}")
+
+        # Batch create GitHub issues from TODOs
+        for f in workspace.glob("**/*.py"):
+            for i, line in enumerate(workspace.read(f).splitlines(), 1):
+                if "TODO:" in line:
+                    mcp.tools.github.create_issue(
+                        owner="org", repo="repo",
+                        title=f"TODO from {f}:{i}",
+                        body=line.strip()
+                    )
+
+        STATE: Variables persist across calls. Use reset=True to clear.
 
         Args:
             code: Python code to execute
-            reset: If True, reset namespace before execution (preserves injected utilities)
-            timeout: Reserved for future use (currently only affects MCP tool calls)
-            inject: Optional dict of variables to inject into namespace before execution.
-                   Useful for passing data from Claude's context into the REPL.
+            reset: Clear namespace before execution (keeps utilities)
+            timeout: Reserved for MCP tool call timeouts
+            inject: Variables to inject (e.g., inject={"data": [1,2,3]})
 
         Returns:
-            Dict containing:
-            - success: Whether execution succeeded
-            - stdout: Captured standard output
-            - stderr: Captured standard error
-            - return_value: String representation of return value (if any)
-            - exception: Exception details (if execution failed)
-            - execution_time_ms: Execution time in milliseconds
-            - namespace_vars: Current namespace variables
-
-        Examples:
-            # Basic execution with state persistence
-            execute_python(code="x = 42")
-            execute_python(code="print(x)")  # Output: 42
-
-            # Use workspace utilities
-            execute_python(code='''
-files = workspace.glob("**/*.py")
-print(f"Found {len(files)} Python files")
-            ''')
-
-            # Use git utilities
-            execute_python(code='''
-commits = git.log(n=5)
-for c in commits:
-    print(f"{c.short_hash}: {c.message}")
-            ''')
-
-            # Inject data from Claude's context
-            execute_python(
-                code="print(f'Processing {len(files)} files')",
-                inject={"files": ["a.py", "b.py", "c.py"]}
-            )
-
-            # Call MCP tools - default 60s timeout applies
-            execute_python(code='''
-result = mcp.tools.github.search_repositories(query="python repl")
-print(result)
-            ''')
-
-            # Reset namespace
-            execute_python(code="y = 100", reset=True)
+            success, stdout, stderr, return_value, exception, execution_time_ms, namespace_vars
         """
         if reset:
             repl_engine.reset_namespace()
