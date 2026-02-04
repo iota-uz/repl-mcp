@@ -16,7 +16,7 @@ from .models import ExecutionResult, ExceptionInfo
 # and preserved during reset
 RESERVED_NAMES = frozenset({
     "__builtins__", "__name__", "__doc__", "__package__",
-    "mcp", "workspace", "git", "ast_utils",
+    "mcp", "workspace", "git", "ast_utils", "code",
 })
 
 
@@ -30,6 +30,7 @@ class REPLEngine:
         enable_workspace: bool = True,
         enable_git: bool = True,
         enable_ast: bool = True,
+        enable_code: bool = True,
     ):
         """
         Initialize REPL engine with persistent namespace and utilities.
@@ -39,7 +40,8 @@ class REPLEngine:
             workspace_root: Root directory for workspace operations (default: cwd)
             enable_workspace: Enable workspace file utilities
             enable_git: Enable git utilities (if in a git repo)
-            enable_ast: Enable AST analysis utilities
+            enable_ast: Enable AST analysis utilities (Python only)
+            enable_code: Enable multi-language code analysis utilities (tree-sitter)
         """
         self.globals: dict[str, Any] = {"__builtins__": __builtins__}
         self.workspace_root = workspace_root or Path.cwd()
@@ -70,7 +72,7 @@ class REPLEngine:
             except Exception:
                 pass  # Not a git repo or other error
 
-        # Initialize AST utilities (Phase 3 - will be implemented later)
+        # Initialize AST utilities (Python-specific, uses built-in ast module)
         self._ast_utils = None
         if enable_ast and self._workspace:
             try:
@@ -78,9 +80,21 @@ class REPLEngine:
                 self._ast_utils = ASTUtils(self._workspace)
                 self.globals["ast_utils"] = self._ast_utils
             except ImportError:
-                pass  # ASTUtils not yet implemented
+                pass  # ASTUtils not available
             except Exception:
                 pass  # AST init failed
+
+        # Initialize multi-language code utilities (uses tree-sitter)
+        self._code_utils = None
+        if enable_code and self._workspace:
+            try:
+                from .utilities.code_utils import CodeUtils
+                self._code_utils = CodeUtils(self._workspace)
+                self.globals["code"] = self._code_utils
+            except ImportError:
+                pass  # tree-sitter not available
+            except Exception:
+                pass  # CodeUtils init failed
 
     def execute(
         self,

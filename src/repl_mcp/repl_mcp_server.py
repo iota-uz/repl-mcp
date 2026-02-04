@@ -192,7 +192,8 @@ def create_server(
         - mcp: Connected MCP servers and their tools
         - workspace: Sandboxed file access (read, write, glob, etc.)
         - git: Git repository operations (log, diff, blame, status)
-        - ast_utils: Code analysis utilities (find functions, classes, imports)
+        - ast_utils: Python code analysis (find functions, classes, imports)
+        - code: Multi-language code analysis via tree-sitter (100+ languages)
 
         MCP tool calls made within the code have a 60-second timeout by default.
         You can override this per-call using the _timeout parameter.

@@ -15,6 +15,7 @@ from .base import (
 from .workspace import Workspace
 from .git_utils import GitUtils
 from .ast_utils import ASTUtils
+from .code_utils import CodeUtils
 
 __all__ = [
     # Protocol
@@ -33,4 +34,5 @@ __all__ = [
     "Workspace",
     "GitUtils",
     "ASTUtils",
+    "CodeUtils",
 ]
