@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 from typing import Any, Optional
 from contextlib import AsyncExitStack
 
@@ -14,8 +15,11 @@ from mcp.client.sse import sse_client
 
 from .models import ServerConfig
 
-# Allow nested event loops for sync wrapper
-nest_asyncio.apply()
+# Allow nested event loops for sync wrapper.
+# Python 3.14 + anyio can fail when nest_asyncio patches the loop used by
+# FastMCP server startup, so skip auto-patching there.
+if sys.version_info < (3, 14):
+    nest_asyncio.apply()
 
 logger = logging.getLogger(__name__)
 

@@ -5,6 +5,7 @@ import subprocess
 import time
 import signal
 import socket
+import uuid
 from pathlib import Path
 
 try:
@@ -106,3 +107,35 @@ class TestHTTPServer:
         # Just verify the endpoint exists
         response = requests.get(f"{http_server}/sse", stream=True, timeout=5)
         assert response.ok
+
+    def test_bulk_upload_endpoint(self, http_server):
+        """Test control-plane bulk upload endpoint."""
+        file_rel_path = f"tmp/http-upload-{uuid.uuid4().hex}.txt"
+        file_abs_path = Path.cwd() / file_rel_path
+
+        payload = {
+            "files": [
+                {
+                    "path": file_rel_path,
+                    "content": "hello from bulk upload endpoint",
+                    "is_base64": False,
+                }
+            ]
+        }
+        response = requests.post(
+            f"{http_server}/api/sessions/test-chat/uploads/bulk",
+            json=payload,
+            timeout=5,
+        )
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["uploaded"] == 1
+        assert data["total"] == 1
+        assert data["results"][0]["status"] == "ok"
+
+        assert file_abs_path.exists()
+        assert file_abs_path.read_text(encoding="utf-8") == "hello from bulk upload endpoint"
+
+        # Cleanup test artifact
+        file_abs_path.unlink(missing_ok=True)
