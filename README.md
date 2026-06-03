@@ -26,7 +26,17 @@ The plugin bundles the MCP server, a usage skill, and a nudge hook in one instal
 /plugin install python-repl@repl-mcp
 ```
 
-Restart the session and the REPL, skill, and hook are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
+Restart the session and all three components are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
+
+**What the plugin bundles:**
+
+| Component | What it does |
+|---|---|
+| **MCP server** | `execute_python` tool, launched via `uvx` pinned to the release tag (cached after first run; the REPL's working directory is your project, not the plugin cache) |
+| **Skill** (`python-repl`) | Teaches Claude when to reach for the REPL (instead of `python3 -c` / heredocs via Bash) and its gotchas — truncation limits, `inject`, git defaults, regex patterns |
+| **Nudge hook** (PostToolUse) | When Claude runs inline Python through Bash (`python3 -c`, `python3 - <<EOF`, `cmd \| python3`), injects a non-blocking reminder to use `execute_python`. Silent on `python3 script.py`, `python3 -m ...`, `pytest` |
+
+To update later: `/plugin marketplace update repl-mcp` then `/plugin update python-repl@repl-mcp`. To disable just the nudge: uninstall and reinstall isn't needed — disable the hook in `/hooks`, or remove the plugin and use the MCP-only install below.
 
 ### Claude Code (MCP server only)
 
@@ -391,28 +401,33 @@ bash examples/run_all_examples.sh
 
 ```
 repl_mcp/
+├── .claude-plugin/
+│   ├── plugin.json            # Plugin manifest (MCP server + skill + hook)
+│   └── marketplace.json       # Makes the repo installable as a marketplace
+├── skills/python-repl/
+│   └── SKILL.md               # Usage skill shipped with the plugin
+├── hooks/
+│   ├── hooks.json             # PostToolUse hook config
+│   └── nudge-python-repl.sh   # Nudges Claude toward execute_python
 ├── src/repl_mcp/
-│   ├── __init__.py
 │   ├── models.py              # Pydantic data models
 │   ├── repl_engine.py         # Stateful execution engine
 │   ├── mcp_client_wrapper.py  # Sync MCP client wrapper
-│   └── repl_mcp_server.py     # FastMCP server
+│   ├── repl_mcp_server.py     # FastMCP server
+│   └── utilities/
+│       ├── workspace.py       # File access (full FS, absolute/~ paths)
+│       ├── shell.py           # sh() helper (ShellResult / ShellError)
+│       ├── git_utils.py       # Structured git operations
+│       ├── ast_utils.py       # Python AST analysis
+│       └── code_utils.py      # Multi-language analysis (tree-sitter)
 ├── tests/
-│   ├── test_repl_engine.py
-│   ├── test_mcp_wrapper.py
-│   └── test_integration.py
 ├── examples/
-│   ├── 01_basic_execution.py
-│   ├── 02_error_handling.py
-│   ├── 03_mcp_config_file.py
-│   ├── 04_runtime_connection.py
-│   ├── 05_github_bulk_ops.py
-│   └── run_all_examples.sh
-├── .mcp.json                  # MCP server config (auto-connect)
-├── config.yaml                # Server settings
+├── .mcp.dev.json              # Dev-only autoconnect config for this repo
 ├── pyproject.toml             # UV project config
 └── README.md
 ```
+
+**Release process** (for maintainers): bump `version` in `pyproject.toml` and `.claude-plugin/plugin.json`, update the `@vX.Y.Z` tag ref in plugin.json's `mcpServers`, then tag and push. Hook/skill-only changes need only a plugin.json version bump (the MCP server stays pinned to its tag).
 
 ## Troubleshooting
 
