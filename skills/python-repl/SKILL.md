@@ -10,8 +10,10 @@ description: Use INSTEAD of running `python3 -c`, a `python3 - <<EOF` heredoc, o
 `execute_python` is an MCP tool and may be deferred (name visible, schema not loaded). Load it once, then it stays available for the whole session:
 
 ```
-ToolSearch query: "select:mcp__python-repl__execute_python"
+ToolSearch query: "execute_python"
 ```
+
+(The exact tool name depends on install method: `mcp__plugin_python-repl_python-repl__execute_python` via the plugin, `mcp__python-repl__execute_python` via `claude mcp add` — keyword search matches both.)
 
 ## Why over Bash python
 

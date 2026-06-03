@@ -32,7 +32,7 @@ if printf '%s' "$cmd" | grep -Eq \
   -e '\|[[:space:]]*python3?[[:space:]]+-' \
   -e '\|[[:space:]]*python3?[[:space:]]*$'; then
   cat <<'JSON'
-{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "Reminder: prefer the python-repl MCP tool (execute_python) over inline python3 via Bash. It is a warm persistent REPL (~0.1s vs ~3s per spawn), keeps variables/imports across calls, has sh() for shell composition — e.g. json.loads(sh('gh pr view 1 --json title')) — and full filesystem access (open(), absolute paths, ~). If the tool is deferred, load it once with ToolSearch: select:mcp__python-repl__execute_python"}}
+{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "Reminder: prefer the python-repl MCP tool (execute_python) over inline python3 via Bash. It is a warm persistent REPL (~0.1s vs ~3s per spawn), keeps variables/imports across calls, has sh() for shell composition — e.g. json.loads(sh('gh pr view 1 --json title')) — and full filesystem access (open(), absolute paths, ~). If the tool is deferred, load it once with ToolSearch query \"execute_python\"."}}
 JSON
 fi
 
