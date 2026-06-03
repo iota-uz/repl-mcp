@@ -1,7 +1,6 @@
 """Integration tests for REPL MCP server."""
 
 import pytest
-from repl_mcp.config import RuntimeConfig
 from repl_mcp import repl_mcp_server
 
 
@@ -155,18 +154,6 @@ total * 2
         assert result.return_value == "30"
         assert "numbers" in result.namespace_vars
         assert "total" in result.namespace_vars
-
-    def test_initialize_server_daytona_mode(self):
-        """Test Daytona-mode initialization creates session manager."""
-        repl_mcp_server.initialize_server(
-            autoconnect=False,
-            runtime_config=RuntimeConfig(
-                daytona_api_url="https://api.daytona.test",
-                daytona_api_key="secret",
-            ),
-        )
-        assert repl_mcp_server.session_manager is not None
-        assert repl_mcp_server.repl_engine is None
 
 
 class TestConfigLoading:

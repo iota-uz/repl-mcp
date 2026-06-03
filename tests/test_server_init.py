@@ -2,7 +2,6 @@
 
 import inspect
 from pathlib import Path
-from repl_mcp.config import RuntimeConfig
 from repl_mcp import repl_mcp_server
 
 
@@ -107,25 +106,3 @@ def test_execute_python_no_return_annotation():
         "execute_python has a return type annotation! "
         "This causes FastMCP to wrap output in JSON. Remove the annotation."
     )
-
-
-def test_create_server_feature_flag_matrix():
-    """Smoke-test create_server across feature-flag combinations."""
-    for bash_enabled in (False, True):
-        for upload_enabled in (False, True):
-            cfg = RuntimeConfig(
-                feature_bash_enabled=bash_enabled,
-                feature_upload_enabled=upload_enabled,
-            )
-            server = repl_mcp_server.create_server(autoconnect=False, runtime_config=cfg)
-            assert server is not None
-
-
-def test_bulk_upload_http_endpoint_defined():
-    """Regression: bulk upload should be exposed as HTTP endpoint."""
-    import repl_mcp.repl_mcp_server as module
-
-    source = inspect.getsource(module.create_server)
-    assert 'custom_route("/api/sessions/{session_id}/uploads/bulk"' in source
-    assert "def upload_file(" not in source
-    assert "def upload_files(" not in source

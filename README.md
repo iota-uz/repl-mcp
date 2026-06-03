@@ -41,7 +41,7 @@ To update later: `/plugin marketplace update repl-mcp` then `/plugin update pyth
 ### Claude Code (MCP server only)
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.1.0 repl-mcp
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.2.0 repl-mcp
 ```
 
 Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
@@ -49,7 +49,7 @@ Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.1.0 repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.2.0 repl-mcp
 ```
 
 ### Claude Desktop
@@ -61,7 +61,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.1.0", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.2.0", "repl-mcp"]
     }
   }
 }
