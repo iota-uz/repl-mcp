@@ -1,17 +1,19 @@
-"""Sandboxed workspace file access for REPL MCP."""
+"""Workspace file access for REPL MCP with full filesystem support."""
 
 import os
 from pathlib import Path
 from typing import Union
 
-from .base import REPLUtility, PathEscapeError, WriteDisabledError, WorkspaceError
+from .base import REPLUtility, WriteDisabledError, WorkspaceError
 
 
 class Workspace(REPLUtility):
     """
-    Sandboxed file access within workspace root.
+    File access rooted at the workspace, with full filesystem support.
 
-    All paths are relative to workspace root and cannot escape via .. or symlinks.
+    Relative paths resolve against the workspace root. Absolute paths and
+    ~-prefixed paths are used as-is — the whole filesystem is accessible
+    (matching the REPL itself, where open() is unrestricted).
 
     Methods:
         read(path) -> str           Read file contents
@@ -44,15 +46,19 @@ class Workspace(REPLUtility):
         >>> workspace.exists("config.json")
         True
 
+        >>> workspace.read("/tmp/data.json")          # absolute paths work
+        >>> workspace.glob("~/Projects/**/*.py")      # ~ expansion works
+
         >>> workspace.write("output.txt", "Hello, World!")
 
         >>> for result in workspace.search("TODO", "src/"):
         ...     print(f"{result['file']}:{result['line_num']}: {result['line']}")
 
-    Security:
-        - Path traversal (../) is blocked
-        - Symlinks escaping workspace are blocked
+    Notes:
+        - Full filesystem access: absolute and ~ paths supported everywhere
         - Write operations can be disabled via allow_write=False
+        - Results under the workspace root are reported as relative paths;
+          results outside it are reported as absolute paths
     """
 
     def __init__(self, root: Union[str, Path], allow_write: bool = True):
@@ -71,27 +77,25 @@ class Workspace(REPLUtility):
             raise ValueError(f"Workspace root is not a directory: {self.root}")
 
     def _resolve_safe(self, path: str) -> Path:
-        """Resolve path safely within workspace, blocking escapes.
+        """Resolve a path: relative against workspace root, absolute/~ as-is.
 
         Args:
-            path: Relative path within workspace
+            path: Relative, absolute, or ~-prefixed path
 
         Returns:
             Resolved absolute Path
-
-        Raises:
-            PathEscapeError: If path escapes workspace root
         """
-        # Normalize and resolve the path
-        resolved = (self.root / path).resolve()
+        p = Path(path).expanduser()
+        if p.is_absolute():
+            return p.resolve()
+        return (self.root / p).resolve()
 
-        # Check that resolved path is within workspace root
+    def _display_path(self, path: Path) -> str:
+        """Render a path relative to root when inside it, absolute otherwise."""
         try:
-            resolved.relative_to(self.root)
+            return str(path.relative_to(self.root))
         except ValueError:
-            raise PathEscapeError(path, str(self.root))
-
-        return resolved
+            return str(path)
 
     def _check_write_allowed(self) -> None:
         """Check if write operations are allowed."""
@@ -114,7 +118,6 @@ class Workspace(REPLUtility):
 
         Raises:
             FileNotFoundError: If file doesn't exist
-            PermissionError: If path escapes workspace
         """
         resolved = self._resolve_safe(path)
         return resolved.read_text(encoding=encoding)
@@ -157,7 +160,7 @@ class Workspace(REPLUtility):
             encoding: Text encoding for string content (default: utf-8)
 
         Raises:
-            PermissionError: If writes disabled or path escapes workspace
+            PermissionError: If writes are disabled (allow_write=False)
         """
         self._check_write_allowed()
         resolved = self._resolve_safe(path)
@@ -195,20 +198,20 @@ class Workspace(REPLUtility):
         """Find files matching glob pattern.
 
         Args:
-            pattern: Glob pattern (e.g., "**/*.py", "src/*.ts")
+            pattern: Glob pattern, relative ("**/*.py", "src/*.ts"),
+                     absolute ("/tmp/*.json"), or ~-prefixed ("~/logs/*.txt")
 
         Returns:
-            List of relative paths matching pattern
+            List of matching paths — relative when under workspace root,
+            absolute otherwise
         """
-        matches = []
-        for path in self.root.glob(pattern):
-            # Only include files within workspace (safety check)
-            try:
-                rel_path = path.relative_to(self.root)
-                matches.append(str(rel_path))
-            except ValueError:
-                continue
-        return sorted(matches)
+        expanded = os.path.expanduser(pattern)
+        if os.path.isabs(expanded):
+            import glob as glob_module
+            paths = (Path(p) for p in glob_module.glob(expanded, recursive=True))
+        else:
+            paths = self.root.glob(expanded)
+        return sorted(self._display_path(p) for p in paths)
 
     def exists(self, path: str) -> bool:
         """Check if path exists.
@@ -219,11 +222,7 @@ class Workspace(REPLUtility):
         Returns:
             True if path exists
         """
-        try:
-            resolved = self._resolve_safe(path)
-            return resolved.exists()
-        except PermissionError:
-            return False
+        return self._resolve_safe(path).exists()
 
     def is_file(self, path: str) -> bool:
         """Check if path is a file.
@@ -309,16 +308,13 @@ class Workspace(REPLUtility):
                 return
 
             for item in items:
-                try:
-                    rel_path = item.relative_to(self.root)
-                    if item.is_file():
-                        if item.match(pattern):
-                            results.append(str(rel_path))
-                    else:
-                        results.append(str(rel_path) + "/")
-                        walk(item, depth + 1)
-                except ValueError:
-                    continue
+                display = self._display_path(item)
+                if item.is_file():
+                    if item.match(pattern):
+                        results.append(display)
+                else:
+                    results.append(display + "/")
+                    walk(item, depth + 1)
 
         walk(resolved, 1)
         return results
@@ -433,11 +429,6 @@ class Workspace(REPLUtility):
                 continue
 
             try:
-                rel_path = file_path.relative_to(self.root)
-            except ValueError:
-                continue
-
-            try:
                 content = file_path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, PermissionError):
                 continue
@@ -445,7 +436,7 @@ class Workspace(REPLUtility):
             for line_num, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
                     results.append({
-                        "file": str(rel_path),
+                        "file": self._display_path(file_path),
                         "line_num": line_num,
                         "line": line.strip(),
                     })

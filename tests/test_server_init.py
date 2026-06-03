@@ -14,8 +14,8 @@ def test_load_mcp_config_missing_file():
 
 def test_load_mcp_config_valid():
     """Test loading valid config file."""
-    # Use the project's .mcp.json
-    config_path = Path(__file__).parent.parent / ".mcp.json"
+    # Use the project's dev config (.mcp.dev.json)
+    config_path = Path(__file__).parent.parent / ".mcp.dev.json"
     if config_path.exists():
         config = repl_mcp_server.load_mcp_config(config_path)
         assert isinstance(config, dict)

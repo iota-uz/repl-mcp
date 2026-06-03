@@ -346,13 +346,17 @@ def create_server(
         ctx: Context = CurrentContext(),
     ):
         """
-        Execute Python in persistent REPL with codebase utilities.
+        Persistent Python REPL — use this instead of `python3 -c`, heredocs,
+        or `cmd | python3` via Bash.
 
-        Use for batch operations, combining data sources, or complex analysis.
-        State persists between calls. Use %help inside for full documentation.
+        State (variables, imports, functions) survives across calls: a warm
+        call takes ~0.1s vs ~3s for each fresh `python3` Bash spawn. Full
+        filesystem access — open(), absolute paths, and ~ all work.
 
         Pre-injected utilities:
-          workspace  - File ops: .read(), .write(), .glob(), .exists()
+          sh         - Shell commands: json.loads(sh("gh pr view 1 --json title"))
+                       Returns stdout str with .returncode/.stderr/.ok
+          workspace  - File ops: .read(), .write(), .glob() (absolute paths OK)
           git        - Git ops: .log(), .diff(), .blame(), .status()
           ast_utils  - Python AST: .find_functions(), .find_classes(), .find_calls()
           code       - Multi-lang (100+ languages): .find_functions(), .find_classes()
@@ -360,13 +364,14 @@ def create_server(
 
         Quick reference:
           %help       - Full documentation and examples
-          object?     - Show docstring (e.g., workspace?, git.log?)
+          object?     - Show docstring (e.g., sh?, workspace?, git.log?)
           %who        - List variables
           %history    - Show execution history
 
         Args:
             code: Python code to execute
             reset: Clear namespace (keeps utilities)
+            timeout: Max execution seconds (default 120)
             inject: Variables to inject (e.g., {"data": [1,2,3]})
 
         Returns:

@@ -16,6 +16,7 @@ from .workspace import Workspace
 from .git_utils import GitUtils
 from .ast_utils import ASTUtils
 from .code_utils import CodeUtils
+from .shell import sh, make_sh, ShellResult, ShellError
 
 __all__ = [
     # Protocol
@@ -35,4 +36,9 @@ __all__ = [
     "GitUtils",
     "ASTUtils",
     "CodeUtils",
+    # Shell helper
+    "sh",
+    "make_sh",
+    "ShellResult",
+    "ShellError",
 ]

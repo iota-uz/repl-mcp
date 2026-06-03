@@ -301,6 +301,23 @@ class TestEnhancedErrors:
 class TestWarnings:
     """Tests for warning system."""
 
+    def test_namespace_warning_fires_once_per_session(self):
+        """Large-namespace warning fires on first crossing only, not every call."""
+        engine = REPLEngine()
+        result1 = engine.execute("\n".join(f"var_{i} = {i}" for i in range(60)))
+        result2 = engine.execute("extra = 1")
+
+        warns1 = [w for w in result1.warnings if w.category == "large_namespace"]
+        warns2 = [w for w in result2.warnings if w.category == "large_namespace"]
+        assert len(warns1) == 1
+        assert len(warns2) == 0  # already warned this session
+
+        # Reset clears the flag so a fresh namespace can warn again
+        engine.reset_namespace()
+        result3 = engine.execute("\n".join(f"new_{i} = {i}" for i in range(60)))
+        warns3 = [w for w in result3.warnings if w.category == "large_namespace"]
+        assert len(warns3) == 1
+
     def test_warning_for_large_output(self):
         """Test warning is generated for large output."""
         engine = REPLEngine()

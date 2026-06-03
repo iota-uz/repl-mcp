@@ -229,52 +229,98 @@ class TestWorkspaceFilesystem:
         assert not (tmp_path / "source.txt").exists()  # Original is gone
 
 
-class TestWorkspaceSecurity:
-    """Test workspace security features."""
+class TestWorkspaceAbsolutePaths:
+    """Test full filesystem access: absolute, ~, and traversal paths all work."""
 
-    def test_path_traversal_blocked(self, tmp_path):
-        """Test that path traversal attacks are blocked."""
+    def test_absolute_path_read(self, tmp_path):
+        """Absolute paths outside the workspace root are readable."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "data.json"
+        target.write_text('{"ok": true}')
+
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        assert ws.read(str(target)) == '{"ok": true}'
+
+    def test_absolute_path_write(self, tmp_path):
+        """Absolute-path writes outside the workspace root work."""
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        target = tmp_path / "out" / "result.txt"
+        ws.write(str(target), "written")
+        assert target.read_text() == "written"
+
+    def test_path_traversal_resolves(self, tmp_path):
+        """Relative ../ paths resolve instead of raising."""
+        outside = tmp_path / "sibling.txt"
+        outside.write_text("sibling")
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        assert ws.read("../sibling.txt") == "sibling"
+
+    def test_tilde_expansion(self, tmp_path, monkeypatch):
+        """~-prefixed paths expand to the user's home directory."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "homefile.txt").write_text("home")
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        assert ws.read("~/homefile.txt") == "home"
+
+    def test_absolute_glob(self, tmp_path):
+        """Absolute glob patterns return absolute matches (regression:
+        previously raised NotImplementedError)."""
+        outside = tmp_path / "data"
+        outside.mkdir()
+        (outside / "a.json").write_text("{}")
+        (outside / "b.json").write_text("{}")
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        matches = ws.glob(str(outside / "*.json"))
+        assert len(matches) == 2
+        assert all(m.startswith(str(outside)) for m in matches)
+
+    def test_relative_glob_still_relative(self, tmp_path):
+        """Relative glob results stay relative to workspace root."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("pass")
         ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.read("../../../etc/passwd")
+        assert ws.glob("**/*.py") == ["src/main.py"]
 
-    def test_path_traversal_with_nested_start(self, tmp_path):
-        """Test path traversal from nested directory."""
-        (tmp_path / "subdir").mkdir()
-        ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.read("subdir/../../etc/passwd")
+    def test_exists_absolute(self, tmp_path):
+        """exists() works with absolute paths."""
+        target = tmp_path / "afile.txt"
+        target.write_text("x")
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        assert ws.exists(str(target)) is True
+        assert ws.exists(str(tmp_path / "missing.txt")) is False
 
-    def test_absolute_path_outside_workspace(self, tmp_path):
-        """Test that absolute paths outside workspace are blocked."""
-        ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.read("/etc/passwd")
+    def test_search_outside_root_reports_absolute(self, tmp_path):
+        """search() in a directory outside root reports absolute file paths."""
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        (outside / "notes.txt").write_text("find TODO here")
+        ws_root = tmp_path / "root"
+        ws_root.mkdir()
+        ws = Workspace(ws_root)
+        results = ws.search("TODO", str(outside))
+        assert len(results) == 1
+        assert results[0]["file"] == str(outside / "notes.txt")
 
-    def test_symlink_escape_blocked(self, tmp_path):
-        """Test that symlinks pointing outside workspace are blocked."""
-        # Create a symlink pointing outside the workspace
-        link_path = tmp_path / "escape_link"
-        try:
-            link_path.symlink_to("/etc")
-        except OSError:
-            pytest.skip("Cannot create symlinks (permissions)")
-
-        ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.read("escape_link/passwd")
-
-    def test_write_traversal_blocked(self, tmp_path):
-        """Test that write path traversal is blocked."""
-        ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.write("../outside.txt", "malicious")
-
-    def test_mkdir_traversal_blocked(self, tmp_path):
-        """Test that mkdir path traversal is blocked."""
-        ws = Workspace(tmp_path)
-        with pytest.raises(PermissionError, match="escapes workspace"):
-            ws.mkdir("../outside_dir")
+    def test_write_disabled_still_enforced(self, tmp_path):
+        """allow_write=False still blocks writes, including absolute paths."""
+        ws = Workspace(tmp_path, allow_write=False)
+        with pytest.raises(PermissionError):
+            ws.write("anything.txt", "nope")
+        with pytest.raises(PermissionError):
+            ws.write(str(tmp_path / "abs.txt"), "nope")
 
 
 class TestWorkspaceSearch:

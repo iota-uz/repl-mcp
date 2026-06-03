@@ -4,10 +4,13 @@
 
 This is a Model Context Protocol (MCP) server that provides a Python REPL environment with the ability to connect to other MCP servers. Built with FastMCP, it allows:
 
-- **Interactive Python execution** via `execute_python` tool
+- **Interactive Python execution** via `execute_python` tool (persistent namespace across calls)
+- **Shell composition** - pre-injected `sh()` helper returns command stdout as a str subclass (`.returncode`/`.stderr`/`.ok`), replacing `cmd | python3 -c` pipelines
+- **Full filesystem access** - `open()`, absolute paths, and `~` work everywhere; `workspace.*` accepts them too (no path sandbox)
 - **MCP server connections** - Connect to and use tools from other MCP servers
 - **Dual transport modes** - stdio (for Claude Desktop) and SSE (for Claude Code CLI)
 - **Auto-connect** - Automatically connects to MCP servers listed in `.mcp.json`
+- **Claude Code plugin** - `.claude-plugin/` + `skills/` + `hooks/` make the repo installable as a plugin bundling the MCP server, a usage skill, and a Bash-nudge hook
 
 **Key Use Case**: Acts as a "meta-server" that can orchestrate multiple MCP tools in a single Python environment.
 
@@ -106,10 +109,15 @@ open htmlcov/index.html
 
 ### Configuration Files
 
-**`.mcp.json`** - MCP server configuration for Claude Code
-- Defines how Claude Code launches this server
-- Lists other MCP servers for autoconnect
-- IMPORTANT: Currently uses `--no-autoconnect` due to startup timeout issues with autoconnect in SSE mode
+**`.mcp.dev.json`** - dev-only MCP config for working *in this repo*
+- Renamed from `.mcp.json` so it isn't auto-discovered as the plugin's MCP bundle
+- Use for autoconnect testing: `uv run repl-mcp --config .mcp.dev.json`
+- At runtime in user projects, the server autoconnects from the *user project's* `.mcp.json` (cwd-relative default)
+
+**`.claude-plugin/plugin.json`** - Claude Code plugin manifest
+- Bundles the MCP server (`uvx --from git+...@vX.Y.Z` — pinned tag so uvx caches the build and cwd stays at the user's project; do NOT use `uv run --directory`, it chdirs and roots `workspace` at the plugin cache), the `skills/python-repl` skill, and the `hooks/` nudge hook
+- `.claude-plugin/marketplace.json` makes the repo installable via `/plugin marketplace add iota-uz/repl-mcp`
+- RELEASE: bump `version` in pyproject.toml + plugin.json AND the `@vX.Y.Z` tag ref in plugin.json's mcpServers, then tag + push
 
 **`pyproject.toml`** - Python project configuration
 - Dependencies and build settings
@@ -183,21 +191,33 @@ Edit `src/repl_mcp/context.py`:
 
 ```
 repl_mcp/
-├── .mcp.json                    # Claude Code MCP configuration
+├── .claude-plugin/
+│   ├── plugin.json              # Plugin manifest (bundles MCP server + skill + hook)
+│   └── marketplace.json         # Makes repo installable as a marketplace
+├── skills/python-repl/SKILL.md  # Usage skill (shipped with plugin)
+├── hooks/
+│   ├── hooks.json               # PostToolUse hook config
+│   └── nudge-python-repl.sh     # Nudges Claude toward execute_python on python3 -c
+├── .mcp.dev.json                # Dev-only MCP config (renamed from .mcp.json)
 ├── CLAUDE.md                    # This file - project guide
 ├── pyproject.toml               # Python project config
 ├── src/repl_mcp/
 │   ├── __init__.py
-│   ├── repl_mcp_server.py      # Main server (FastMCP)
-│   ├── context.py              # Python REPL execution context
-│   └── mcp_client.py           # MCP client for connections
-├── tests/
-│   ├── test_context.py         # REPL context tests
-│   ├── test_repl_mcp_server.py # Server unit tests
-│   ├── test_mcp_client.py      # MCP client tests
-│   └── test_claude_code_integration.py  # Integration tests
-└── test_live_integration.py    # Live E2E test
-
+│   ├── repl_mcp_server.py       # Main server (FastMCP)
+│   ├── repl_engine.py           # Stateful REPL execution engine
+│   ├── mcp_client_wrapper.py    # MCP client for connections
+│   ├── models.py                # Pydantic data models
+│   └── utilities/
+│       ├── workspace.py         # File access (full FS, absolute/~ paths)
+│       ├── shell.py             # sh() helper (ShellResult/ShellError)
+│       ├── git_utils.py         # Structured git ops
+│       ├── ast_utils.py         # Python AST analysis
+│       └── code_utils.py        # Multi-language analysis (tree-sitter)
+└── tests/
+    ├── test_repl_engine.py      # Engine tests
+    ├── test_shell.py            # sh() helper tests
+    ├── test_workspace.py        # Workspace tests (incl. absolute paths)
+    └── test_claude_code_integration.py  # Integration tests
 ```
 
 ## Development Workflow

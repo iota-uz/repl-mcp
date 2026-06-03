@@ -80,11 +80,12 @@ class TestClaudeCodeIntegration:
 
     @pytest.mark.asyncio
     async def test_full_mcp_json_flow(self, clean_environment):
-        """Test complete flow using exact .mcp.json configuration."""
-        # Load actual config
-        config_path = PROJECT_ROOT / ".mcp.json"
+        """Test complete flow using exact dev MCP configuration."""
+        # Load actual config (.mcp.dev.json — renamed from .mcp.json so it
+        # isn't auto-discovered as the plugin's MCP bundle)
+        config_path = PROJECT_ROOT / ".mcp.dev.json"
         if not config_path.exists():
-            pytest.skip(".mcp.json not found")
+            pytest.skip(".mcp.dev.json not found")
 
         config = json.loads(config_path.read_text())
         python_repl = config.get("mcpServers", {}).get("python-repl")

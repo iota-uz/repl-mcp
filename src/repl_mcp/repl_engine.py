@@ -16,7 +16,7 @@ from .models import ExecutionResult, ExceptionInfo, TruncationInfo, WarningInfo
 # and preserved during reset
 RESERVED_NAMES = frozenset({
     "__builtins__", "__name__", "__doc__", "__package__",
-    "mcp", "workspace", "git", "ast_utils", "code",
+    "mcp", "workspace", "git", "ast_utils", "code", "sh",
 })
 
 # Output size limits (characters)
@@ -131,10 +131,6 @@ def _detect_common_errors(
         if match:
             undefined_name = match.group(1)
 
-            # Check for common mistakes
-            if undefined_name == "open":
-                hints.append("Did you mean workspace.read() instead of open()?")
-
             # Find similar names in namespace using difflib
             available_names = list(namespace.keys())
             similar = get_close_matches(undefined_name, available_names, n=3, cutoff=0.6)
@@ -157,16 +153,14 @@ def _detect_common_errors(
             elif obj_type == "GitUtils" and attr_name == "commits":
                 hints.append("Use git.log(n=10) to get commits")
 
-    # FileNotFoundError: suggest workspace methods
+    # FileNotFoundError: suggest existence checks
     elif exc_type == "FileNotFoundError":
-        if "open" in code or "Path" in code:
-            hints.append("Use workspace.read(path) instead of open() for file access")
-            hints.append("Use workspace.exists(path) to check if files exist")
+        if "open" in code or "Path" in code or "workspace" in code:
+            hints.append("Check the path exists first: workspace.exists(path) — workspace.read() and open() both accept absolute, relative, and ~ paths")
 
-    # ImportError: suggest checking dependencies
+    # ImportError: suggest installing into the server venv
     elif exc_type in ["ImportError", "ModuleNotFoundError"]:
-        hints.append("Module may not be available in the sandboxed environment")
-        hints.append("Check if you need to use mcp.tools to access external functionality")
+        hints.append("Module not installed in the REPL server's venv — install it via sh('uv pip install <pkg>') or use the Bash tool")
 
     # ZeroDivisionError: generic hint
     elif exc_type == "ZeroDivisionError":
@@ -179,6 +173,10 @@ def _detect_common_errors(
     # IndexError: suggest bounds checking
     elif exc_type == "IndexError":
         hints.append("Check sequence length before indexing")
+
+    # Verbose subprocess usage: point at the sh() helper
+    if "subprocess" in code or "os.system" in code:
+        hints.append("Tip: the pre-injected sh(cmd) helper runs shell commands and returns stdout as a str — e.g. json.loads(sh('gh pr list --json number'))")
 
     return hints, similar_names
 
@@ -266,17 +264,8 @@ def _generate_warnings(
             }
         ))
 
-    # Warn about large namespace
-    if namespace_size > WARN_NAMESPACE_SIZE:
-        warnings.append(WarningInfo(
-            category="large_namespace",
-            message=f"Namespace has {namespace_size} variables (>{WARN_NAMESPACE_SIZE} threshold)",
-            suggestion="Consider using reset=True to clear namespace or use more focused variable names",
-            metadata={
-                "namespace_size": namespace_size,
-                "threshold": WARN_NAMESPACE_SIZE
-            }
-        ))
+    # Note: the large-namespace warning is handled in REPLEngine.execute()
+    # (fires once per session, needs engine state)
 
     return warnings
 
@@ -313,6 +302,9 @@ class REPLEngine:
         self._history: list[str] = []
         self._max_history = max_history
 
+        # Large-namespace warning fires once per session (reset clears it)
+        self._namespace_warning_emitted = False
+
         # Inject MCP wrapper
         if mcp_wrapper:
             self.globals["mcp"] = mcp_wrapper
@@ -326,6 +318,13 @@ class REPLEngine:
                 self.globals["workspace"] = self._workspace
             except Exception:
                 pass  # Workspace init failed, skip
+
+        # Inject shell helper bound to workspace root
+        try:
+            from .utilities.shell import make_sh
+            self.globals["sh"] = make_sh(self.workspace_root)
+        except Exception:
+            pass  # Shell helper init failed, skip
 
         # Initialize git utilities (Phase 2 - will be implemented later)
         self._git = None
@@ -513,6 +512,20 @@ class REPLEngine:
             return_value_info
         )
 
+        # Large-namespace warning: fire once per session, not on every call
+        namespace_size = len(namespace_vars)
+        if namespace_size > WARN_NAMESPACE_SIZE and not self._namespace_warning_emitted:
+            self._namespace_warning_emitted = True
+            warnings.append(WarningInfo(
+                category="large_namespace",
+                message=f"Namespace has {namespace_size} variables (>{WARN_NAMESPACE_SIZE} threshold)",
+                suggestion="Consider using reset=True to clear namespace or use more focused variable names",
+                metadata={
+                    "namespace_size": namespace_size,
+                    "threshold": WARN_NAMESPACE_SIZE
+                }
+            ))
+
         return ExecutionResult(
             success=success,
             stdout=stdout_truncated,
@@ -608,6 +621,9 @@ class REPLEngine:
         self.globals.clear()
         self.globals["__builtins__"] = __builtins__
         self.globals.update(saved)
+
+        # Fresh namespace may warn again when it grows large
+        self._namespace_warning_emitted = False
 
     def get_namespace_vars(self) -> dict[str, str]:
         """Get current namespace variables (excluding reserved names)."""
@@ -982,7 +998,10 @@ class REPLEngine:
 Python REPL with integrated utilities
 
 Utilities:
+  sh         - Shell commands: data = json.loads(sh("gh pr list --json number"))
+               Returns stdout str with .returncode/.stderr/.ok; check=False to not raise
   workspace  - File access: workspace.read(path), workspace.glob("**/*.py")
+               Absolute and ~ paths supported
   git        - Git ops: git.log(), git.diff(), git.blame(path)
   ast_utils  - Python AST: ast_utils.find_functions(path)
   code       - Multi-lang: code.find_functions(path) (100+ languages)
@@ -1008,7 +1027,8 @@ Standard Python:
   type(obj)     Show type
 
 Tips:
-  - Use workspace.read() instead of open()
+  - open(), absolute paths, and ~ all work (full filesystem access)
+  - sh() composes shell + Python in one call (replaces `cmd | python3 -c`)
   - Variables persist between calls (use %reset to clear)
   - Use %history to recall previous code
 """

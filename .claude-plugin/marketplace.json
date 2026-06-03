@@ -1,0 +1,19 @@
+{
+  "name": "repl-mcp",
+  "owner": {
+    "name": "iota-uz",
+    "url": "https://github.com/iota-uz"
+  },
+  "metadata": {
+    "description": "Python REPL MCP server plugin for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "python-repl",
+      "source": "./",
+      "description": "Persistent Python REPL with sh() shell composition, full filesystem access, git/AST utilities, and MCP orchestration. Bundles the MCP server, a usage skill, and a nudge hook.",
+      "category": "development",
+      "tags": ["python", "repl", "shell", "codebase-analysis"]
+    }
+  ]
+}

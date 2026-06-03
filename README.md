@@ -4,7 +4,10 @@ A Model Context Protocol (MCP) server that provides a stateful Python REPL with 
 
 ## Features
 
-- **Stateful Execution**: Variables, imports, and function definitions persist across executions
+- **Stateful Execution**: Variables, imports, and function definitions persist across executions (~0.1s warm calls vs ~3s per fresh `python3 -c` spawn)
+- **Shell Composition**: Pre-injected `sh()` helper — `json.loads(sh("gh pr view 1 --json title"))` replaces `cmd | python3 -c` pipelines
+- **Full Filesystem Access**: `open()`, absolute paths, and `~` all work; `workspace.*` helpers accept them too
+- **Codebase Utilities**: `workspace` (files), `git` (structured log/diff/blame), `ast_utils` (Python AST), `code` (100+ languages via tree-sitter)
 - **MCP Tool Integration**: Call other MCP tools programmatically via `mcp.tools.server.method(...)`
 - **Auto-connect**: Automatically connect to MCP servers from `.mcp.json` on startup
 - **Output Capture**: Full stdout, stderr, exceptions, and return values
@@ -13,20 +16,30 @@ A Model Context Protocol (MCP) server that provides a stateful Python REPL with 
 
 ## Installation
 
-### Claude Code (Recommended)
+### Claude Code Plugin (Recommended)
 
-One command to install:
+The plugin bundles the MCP server, a usage skill, and a nudge hook in one install:
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp repl-mcp
+# In Claude Code:
+/plugin marketplace add iota-uz/repl-mcp
+/plugin install python-repl@repl-mcp
 ```
 
-That's it. The REPL is now available in Claude Code.
+Restart the session and the REPL, skill, and hook are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
+
+### Claude Code (MCP server only)
+
+```bash
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.1.0 repl-mcp
+```
+
+Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.1.0 repl-mcp
 ```
 
 ### Claude Desktop
@@ -38,7 +51,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.1.0", "repl-mcp"]
     }
   }
 }
@@ -107,11 +120,44 @@ uv run repl-mcp --transport stdio
 
 The server exposes one MCP tool:
 
-- `execute_python(code, reset=False, inject=None)` - Execute Python in a persistent REPL
+- `execute_python(code, reset=False, timeout=120, inject=None)` - Execute Python in a persistent REPL
 
-Inside the REPL, use `%help` for documentation, `object?` for quick help, and `%who` to list variables.
+Inside the REPL, use `%help` for documentation, `object?` for quick help (e.g. `sh?`), and `%who` to list variables.
 
 ## Usage Examples
+
+### Shell + Python in One Call
+
+The `sh()` helper returns stdout as a `str` subclass with `.returncode`, `.stderr`, and `.ok`:
+
+```python
+execute_python(code="""
+import json
+
+# Replaces: gh pr view 2822 --json statusCheckRollup | python3 -c "..."
+d = json.loads(sh("gh pr view 2822 --json statusCheckRollup"))
+for c in d["statusCheckRollup"]:
+    print(c["name"], c["conclusion"])
+
+# Inspect failures without raising
+r = sh("pytest -q", check=False)
+if not r.ok:
+    print(r.returncode, r.stderr[-500:])
+""")
+```
+
+### Full Filesystem Access
+
+```python
+execute_python(code="""
+import json
+
+# Absolute paths and ~ work everywhere — open(), workspace, glob
+raw = json.load(open("/tmp/data.json"))
+logs = workspace.glob("~/logs/**/*.txt")
+workspace.write("/tmp/summary.json", json.dumps({"n": len(logs)}))
+""")
+```
 
 ### Basic Execution with State Persistence
 
@@ -280,6 +326,7 @@ Execute Python code in a persistent REPL environment with pre-injected utilities
 **Parameters:**
 - `code` (str): Python code to execute
 - `reset` (bool, optional): Reset namespace before execution (default: False)
+- `timeout` (float, optional): Max execution seconds (default: 120)
 - `inject` (dict, optional): Variables to inject into namespace
 
 **Returns:**
