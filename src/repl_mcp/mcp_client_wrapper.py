@@ -12,8 +12,16 @@ import nest_asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from .models import ServerConfig
+
+
+def _expand_env_value(value: str) -> str:
+    """Expand a full-value ${VAR} reference from the environment."""
+    if value.startswith("${") and value.endswith("}"):
+        return os.environ.get(value[2:-1], "")
+    return value
 
 # Allow nested event loops for sync wrapper.
 # Python 3.14 + anyio can fail when nest_asyncio patches the loop used by
@@ -132,6 +140,15 @@ class MCPClientWrapper:
         self._exit_stacks: dict[str, AsyncExitStack] = {}
         self._errlogs: dict[str, Any] = {}  # Track errlog file handles
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Loop the sessions were created on. Sessions (and their anyio
+        # streams/tasks) are loop-affine: every await on them MUST run on
+        # this loop. REPL code executes on a worker thread (FastMCP runs
+        # sync tools via anyio.to_thread), so _run_async routes coroutines
+        # back to this loop with run_coroutine_threadsafe. Without this,
+        # any mcp.* call from the REPL deadlocks forever.
+        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Connection failures by server name (reason string), for help()/servers
+        self.failed: dict[str, str] = {}
         self.tools = ToolsContainer(self)
 
     @property
@@ -180,8 +197,40 @@ class MCPClientWrapper:
                 asyncio.set_event_loop(self._loop)
         return self._loop
 
-    def _run_async(self, coro):
-        """Run async coroutine in sync context."""
+    def _run_async(self, coro, timeout: Optional[float] = 30.0):
+        """
+        Run async coroutine in sync context.
+
+        Sessions are bound to the event loop they were connected on
+        (self._owner_loop). When called from a different thread — the normal
+        case: FastMCP executes the sync execute_python tool on a worker
+        thread while the sessions live on the server's main loop — the
+        coroutine is scheduled onto the owner loop thread-safely. Awaiting
+        a session from any other loop deadlocks (anyio streams never wake
+        cross-loop), which is exactly the historical mcp.help() hang.
+
+        Args:
+            coro: Coroutine to run
+            timeout: Max seconds to wait for the result when routing to the
+                     owner loop (None = wait forever; avoid)
+        """
+        owner = self._owner_loop
+        if owner is not None and owner.is_running():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is not owner:
+                future = asyncio.run_coroutine_threadsafe(coro, owner)
+                try:
+                    return future.result(timeout=timeout)
+                except TimeoutError:
+                    future.cancel()
+                    raise TimeoutError(
+                        f"MCP bridge call timed out after {timeout}s"
+                    ) from None
+            # Same loop and it's running: fall through to nest_asyncio path.
+
         loop = self._get_loop()
         # With nest_asyncio, we can always use run_until_complete
         # even when the loop is already running
@@ -207,11 +256,7 @@ class MCPClientWrapper:
                 if config.env:
                     # Expand environment variables in values
                     for key, value in config.env.items():
-                        if value.startswith("${") and value.endswith("}"):
-                            env_var = value[2:-1]
-                            env[key] = os.environ.get(env_var, "")
-                        else:
-                            env[key] = value
+                        env[key] = _expand_env_value(value)
 
                 # Create stdio transport
                 server_params = StdioServerParameters(
@@ -233,19 +278,29 @@ class MCPClientWrapper:
                     ClientSession(stdio, write)
                 )
 
-            else:  # SSE transport
-                sse_transport = await exit_stack.enter_async_context(
-                    sse_client(config.url)
-                )
-                sse, write = sse_transport
+            else:  # HTTP transports
+                # Headers (e.g. Authorization: Bearer ${TOKEN}) with env expansion
+                headers = None
+                if config.headers:
+                    headers = {k: _expand_env_value(v) for k, v in config.headers.items()}
+
+                if config.transport_type == "http":  # streamable HTTP
+                    read, write, _ = await exit_stack.enter_async_context(
+                        streamablehttp_client(config.url, headers=headers)
+                    )
+                else:  # SSE transport
+                    read, write = await exit_stack.enter_async_context(
+                        sse_client(config.url, headers=headers)
+                    )
                 session = await exit_stack.enter_async_context(
-                    ClientSession(sse, write)
+                    ClientSession(read, write)
                 )
 
             # Initialize session
             await session.initialize()
 
             self._sessions[name] = session
+            self.failed.pop(name, None)
             return True
 
         except asyncio.CancelledError:
@@ -264,6 +319,7 @@ class MCPClientWrapper:
             raise
         except Exception as e:
             logger.warning("Failed to connect to %s: %s", name, e)
+            self.failed[name] = f"{type(e).__name__}: {e}"
             if name in self._exit_stacks:
                 await self._exit_stacks[name].aclose()
                 del self._exit_stacks[name]
@@ -294,15 +350,22 @@ class MCPClientWrapper:
         Returns:
             Dict mapping server names to connection success status (True/False)
         """
+        # Sessions become affine to the loop running this connect — record it
+        # so _run_async can route later sync calls (from REPL worker threads)
+        # back here.
+        self._owner_loop = asyncio.get_running_loop()
 
         async def connect_one(name: str, config_dict: dict) -> tuple[str, bool]:
             config = ServerConfig(**config_dict)
             per_server_timeout = config.timeout_s if config.timeout_s is not None else timeout_s
             try:
                 ok = await asyncio.wait_for(self._connect_server(name, config), timeout=per_server_timeout)
+                if not ok and name not in self.failed:
+                    self.failed[name] = "connection failed (see server stderr log)"
                 return name, ok
             except asyncio.TimeoutError:
                 logger.warning("Timed out connecting to %s after %.1fs", name, per_server_timeout)
+                self.failed[name] = f"timed out after {per_server_timeout:.0f}s"
                 # Best-effort cleanup (covers partial initialization).
                 if name in self._exit_stacks:
                     await self._exit_stacks[name].aclose()
@@ -316,6 +379,7 @@ class MCPClientWrapper:
                 return name, False
             except Exception as e:
                 logger.warning("Failed to connect to %s: %s", name, e)
+                self.failed[name] = f"{type(e).__name__}: {e}"
                 return name, False
 
         results: dict[str, bool] = {}
@@ -372,7 +436,11 @@ class MCPClientWrapper:
                     continue
 
                 try:
-                    result = await self._sessions[name].list_tools()
+                    # Per-server timeout: one unresponsive server must not
+                    # stall introspection of the rest.
+                    result = await asyncio.wait_for(
+                        self._sessions[name].list_tools(), timeout=10.0
+                    )
                     tools_by_server[name] = [tool.name for tool in result.tools]
                 except Exception as e:
                     logger.warning("Failed to list tools from %s: %s", name, e)
@@ -408,19 +476,30 @@ class MCPClientWrapper:
             >>> print(mcp.help('github'))       # Show github tools
             >>> print(mcp.help('github', 'create_issue'))  # Show specific tool
         """
+        scope_note = (
+            "Servers come from this project's .mcp.json (autoconnect). "
+            "Host-level connectors (claude.ai Notion/GitHub, user-scope `claude mcp add` servers, plugins) "
+            "are NOT visible here — call those tools directly instead."
+        )
+
         if server is None:
             # Show all servers
             servers = list(self._sessions.keys())
-            if not servers:
-                return "No MCP servers connected"
+            if not servers and not self.failed:
+                return f"No MCP servers connected.\n\n{scope_note}"
 
-            output = "Connected MCP servers:\n"
-            tool_list = self.list_tools()
+            output = "Connected MCP servers:\n" if servers else ""
+            tool_list = self.list_tools() if servers else {}
             for srv in servers:
                 tools = tool_list.get(srv, [])
                 output += f"  {srv} ({len(tools)} tools)\n"
+            if self.failed:
+                output += "Failed to connect:\n"
+                for srv, reason in self.failed.items():
+                    output += f"  {srv}: {reason}\n"
             output += "\nUse mcp.help('server') to see tools for a specific server"
             output += "\nCall tools via mcp.call('server', 'tool', **args) or mcp.tools.<server>.<tool>(**args)"
+            output += f"\n\n{scope_note}"
             return output
 
         elif tool is None:
@@ -498,7 +577,8 @@ class MCPClientWrapper:
                 return str(result.content)
             return None
 
-        return self._run_async(call_tool())
+        # Outer margin over the inner wait_for so the inner timeout fires first
+        return self._run_async(call_tool(), timeout=timeout + 10.0)
 
     def disconnect(self, server: Optional[str] = None) -> None:
         """
@@ -512,7 +592,14 @@ class MCPClientWrapper:
             servers_to_close = [server] if server else list(self._sessions.keys())
             for name in servers_to_close:
                 if name in self._exit_stacks:
-                    await self._exit_stacks[name].aclose()
+                    try:
+                        await self._exit_stacks[name].aclose()
+                    except BaseException as e:
+                        # Best-effort: anyio cancel scopes can't always be
+                        # closed from a different task than they were entered
+                        # in (e.g. shutdown from another task/thread). The
+                        # child transport dies with the process anyway.
+                        logger.debug("Error closing %s: %s", name, e)
                     del self._exit_stacks[name]
                 if name in self._sessions:
                     del self._sessions[name]

@@ -204,6 +204,9 @@ def create_server(
           ast_utils  - Python AST: .find_functions(), .find_classes(), .find_calls()
           code       - Multi-lang (100+ languages): .find_functions(), .find_classes()
           mcp        - MCP tools: .call(server, tool, **args), .servers, .help()
+                       Scope: only servers from this project's .mcp.json —
+                       host-level connectors (claude.ai Notion/GitHub, user-scope
+                       servers) are NOT reachable here; call their tools directly.
 
         Missing package? Install into the running REPL env: sh('uv pip install <pkg>')
 

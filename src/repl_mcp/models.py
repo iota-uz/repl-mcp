@@ -141,22 +141,32 @@ class ServerConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    # Claude Code / MCP configs sometimes include auxiliary keys like "type".
-    type: Optional[str] = Field(default=None, description="Optional transport type hint (ignored)")
+    # Claude Code / MCP configs use "type" to pick the transport
+    # ("stdio" | "sse" | "http"). Optional — inferred when absent.
+    type: Optional[str] = Field(default=None, description="Transport type hint: stdio, sse, or http")
 
     command: Optional[str] = Field(default=None, description="Command to run for stdio transport")
     args: Optional[list[str]] = Field(default=None, description="Arguments for stdio command")
     url: Optional[str] = Field(default=None, description="URL for HTTP/SSE transport")
     env: Optional[dict[str, str]] = Field(default=None, description="Environment variables for the server")
+    headers: Optional[dict[str, str]] = Field(
+        default=None,
+        description="HTTP headers for sse/http transports (values support ${VAR} env expansion)",
+    )
     timeout_s: Optional[float] = Field(
         default=None,
         description="Optional per-server connect timeout in seconds",
     )
 
     @property
-    def transport_type(self) -> Literal["stdio", "sse"]:
+    def transport_type(self) -> Literal["stdio", "sse", "http"]:
         """Determine transport type from config."""
+        if self.type in ("http", "streamable-http", "streamable_http"):
+            return "http"
+        if self.type == "sse":
+            return "sse"
         if self.url:
+            # Legacy default for bare-url configs
             return "sse"
         return "stdio"
 

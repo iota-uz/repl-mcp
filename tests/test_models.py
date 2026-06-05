@@ -86,6 +86,24 @@ class TestModels:
         assert config.args is None
         assert config.env is None
         assert config.url is None
+        assert config.headers is None
+
+    def test_server_config_http(self):
+        """Test ServerConfig for streamable HTTP transport (Claude Code style)."""
+        config = ServerConfig(
+            type="http",
+            url="https://api.example.com/mcp/",
+            headers={"Authorization": "Bearer ${MY_TOKEN}"},
+        )
+
+        assert config.transport_type == "http"
+        assert config.headers == {"Authorization": "Bearer ${MY_TOKEN}"}
+
+    def test_server_config_explicit_sse(self):
+        """Test explicit type=sse wins over the http heuristic."""
+        config = ServerConfig(type="sse", url="https://api.example.com/sse")
+
+        assert config.transport_type == "sse"
 
     def test_execution_result_defaults(self):
         """Test ExecutionResult default values."""
