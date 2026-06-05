@@ -245,9 +245,9 @@ class MCPClientWrapper:
 
         Sessions are bound to the event loop they were connected on
         (self._owner_loop). When called from a different thread — the normal
-        case: FastMCP executes the sync execute_python tool on a worker
-        thread while the sessions live on the server's main loop — the
-        coroutine is scheduled onto the owner loop thread-safely. Awaiting
+        case: execute_python offloads REPL execution to a worker thread
+        (anyio.to_thread) while the sessions live on the server's main loop —
+        the coroutine is scheduled onto the owner loop thread-safely. Awaiting
         a session from any other loop deadlocks (anyio streams never wake
         cross-loop), which is exactly the historical mcp.help() hang.
 

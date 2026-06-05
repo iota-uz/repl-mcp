@@ -5,6 +5,8 @@ import sys
 import json
 import argparse
 import logging
+
+import anyio.to_thread
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -181,8 +183,14 @@ def create_server(
     # NOTE: No return type annotation on execute_python intentionally!
     # Adding `-> str` causes FastMCP to wrap output in {"result": "..."} JSON
     # via structuredContent. We want plain text output for better readability.
+    #
+    # NOTE: async + to_thread offload intentionally! FastMCP runs sync tools
+    # inline on the event loop thread, so long REPL executions froze the whole
+    # server (autoconnect starved, protocol handling blocked). Offloading also
+    # means mcp bridge calls always come from a worker thread and take the
+    # loop-affine run_coroutine_threadsafe path in MCPClientWrapper.
     @mcp_server.tool()
-    def execute_python(
+    async def execute_python(
         code: str,
         reset: bool = False,
         timeout: float = 120.0,
@@ -228,7 +236,9 @@ def create_server(
         if reset:
             repl_engine.reset_namespace()
 
-        result = repl_engine.execute(code, timeout=timeout, inject=inject)
+        result = await anyio.to_thread.run_sync(
+            lambda: repl_engine.execute(code, timeout=timeout, inject=inject)
+        )
         return str(result)
 
     return mcp_server

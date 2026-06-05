@@ -2,10 +2,10 @@
 Regression tests for the cross-event-loop deadlock (mcp.help() hang).
 
 Production execution model: lifespan autoconnect creates sessions on the
-server's MAIN event loop, while FastMCP runs the sync execute_python tool on a
-WORKER thread. Before the loop-affinity fix, any wrapper call from that thread
-awaited loop-bound sessions on a foreign loop and deadlocked forever
-(observed in the wild as a 17-minute mcp.help() hang).
+server's MAIN event loop, while execute_python offloads REPL execution to a
+WORKER thread (anyio.to_thread). Before the loop-affinity fix, any wrapper
+call from that thread awaited loop-bound sessions on a foreign loop and
+deadlocked forever (observed in the wild as a 17-minute mcp.help() hang).
 
 These tests replicate that exact topology: connect on a running loop, then
 call the sync wrapper API from a worker thread with a hard timeout guard.

@@ -106,3 +106,37 @@ def test_execute_python_no_return_annotation():
         "execute_python has a return type annotation! "
         "This causes FastMCP to wrap output in JSON. Remove the annotation."
     )
+
+
+def test_execute_python_runs_off_event_loop_thread():
+    """
+    Regression test: execute_python must offload REPL execution to a worker
+    thread. FastMCP runs sync tools inline on the event loop thread, which
+    froze the whole server during long executions (autoconnect starved,
+    protocol handling blocked). The tool must be async + anyio.to_thread.
+
+    Verified behaviorally via an in-memory FastMCP client: code executed by
+    the tool must NOT see a running event loop in its own thread.
+    """
+    import asyncio
+    from fastmcp import Client
+
+    server = repl_mcp_server.create_server(autoconnect=False)
+
+    async def run():
+        async with Client(server) as client:
+            result = await client.call_tool("execute_python", {"code": (
+                "import asyncio as _a\n"
+                "try:\n"
+                "    _a.get_running_loop()\n"
+                "    print('ON_LOOP_THREAD')\n"
+                "except RuntimeError:\n"
+                "    print('OFF_LOOP_THREAD')\n"
+            )})
+            return "".join(c.text for c in result.content if hasattr(c, "text"))
+
+    text = asyncio.run(run())
+    assert "OFF_LOOP_THREAD" in text, (
+        "execute_python ran on the event loop thread - it must offload via "
+        f"anyio.to_thread.run_sync. Output: {text!r}"
+    )
