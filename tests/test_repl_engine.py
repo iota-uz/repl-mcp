@@ -85,6 +85,34 @@ x + y
         assert result.exception.type == "ZeroDivisionError"
         assert "traceback" in result.exception.traceback.lower()
 
+    def test_traceback_hides_engine_frames(self):
+        """Traceback starts at user code — no repl_engine.py internals leak."""
+        engine = REPLEngine()
+        result = engine.execute("x = 1\nraise RuntimeError('boom')")
+
+        assert not result.success
+        assert "repl_engine.py" not in result.exception.traceback
+        assert "exec(" not in result.exception.traceback
+        assert "<repl>" in result.exception.traceback
+
+    def test_traceback_keeps_library_frames(self):
+        """Frames below user code (stdlib/library) are preserved."""
+        engine = REPLEngine()
+        result = engine.execute("import json\njson.loads('{bad')")
+
+        assert not result.success
+        assert "repl_engine.py" not in result.exception.traceback
+        assert "<repl>" in result.exception.traceback
+
+    def test_syntax_error_traceback_has_no_engine_frames(self):
+        """SyntaxError output shows the error only, not compile() internals."""
+        engine = REPLEngine()
+        result = engine.execute("def foo(")
+
+        assert not result.success
+        assert result.exception.type == "SyntaxError"
+        assert "repl_engine.py" not in result.exception.traceback
+
     def test_namespace_preserved_after_error(self):
         """Test namespace is preserved after error."""
         engine = REPLEngine()

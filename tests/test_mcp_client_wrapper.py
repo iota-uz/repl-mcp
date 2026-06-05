@@ -108,9 +108,36 @@ class TestMCPClientWrapperIntrospection:
         wrapper = MCPClientWrapper()
 
         result = dir(wrapper)
-        expected = ['tools', 'servers', 'list_tools', 'help', 'discover_tools']
+        expected = ['tools', 'servers', 'call', 'list_tools', 'help', 'discover_tools']
         for item in expected:
             assert item in result
+
+    def test_call_not_connected_raises(self):
+        """Test that mcp.call() on an unknown server raises a clear error."""
+        wrapper = MCPClientWrapper()
+
+        with pytest.raises(ValueError, match="not connected"):
+            wrapper.call('github', 'create_issue', title='Bug')
+
+    def test_call_delegates_to_invoke_tool(self):
+        """Test that mcp.call() delegates to _invoke_tool with args intact."""
+        wrapper = MCPClientWrapper()
+        captured = {}
+
+        def fake_invoke(server, tool, timeout=60.0, **kwargs):
+            captured.update(server=server, tool=tool, timeout=timeout, kwargs=kwargs)
+            return "ok"
+
+        wrapper._invoke_tool = fake_invoke
+        result = wrapper.call('github', 'create_issue', timeout=30.0, title='Bug')
+
+        assert result == "ok"
+        assert captured == {
+            'server': 'github',
+            'tool': 'create_issue',
+            'timeout': 30.0,
+            'kwargs': {'title': 'Bug'},
+        }
 
     def test_servers_property_empty_initially(self):
         """Test that servers property is empty when nothing connected."""

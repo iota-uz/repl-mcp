@@ -1,6 +1,6 @@
 [project]
 name = "repl-mcp"
-version = "1.2.1"
+version = "1.3.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
@@ -11,6 +11,9 @@ dependencies = [
     "nest-asyncio>=1.6.0",
     "gitpython>=3.1.0",
     "tree-sitter-language-pack>=0.7.0",
+    # Recurring real-world REPL use case (xlsx analysis); envs are ephemeral
+    # per uvx build, so user installs don't persist — ship it.
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]

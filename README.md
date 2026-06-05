@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server that provides a stateful Python REPL with 
 - **Shell Composition**: Pre-injected `sh()` helper — `json.loads(sh("gh pr view 1 --json title"))` replaces `cmd | python3 -c` pipelines
 - **Full Filesystem Access**: `open()`, absolute paths, and `~` all work; `workspace.*` helpers accept them too
 - **Codebase Utilities**: `workspace` (files), `git` (structured log/diff/blame), `ast_utils` (Python AST), `code` (100+ languages via tree-sitter)
-- **MCP Tool Integration**: Call other MCP tools programmatically via `mcp.tools.server.method(...)`
+- **MCP Tool Integration**: Call other MCP tools programmatically via `mcp.call("server", "tool", **args)` or `mcp.tools.server.method(...)`
 - **Auto-connect**: Automatically connect to MCP servers from `.mcp.json` on startup
 - **Output Capture**: Full stdout, stderr, exceptions, and return values
 - **HTTP & Stdio Transports**: Default HTTP/SSE on port 8000, with stdio fallback for Claude Desktop
@@ -28,6 +28,8 @@ The plugin bundles the MCP server, a usage skill, and a nudge hook in one instal
 
 Restart the session and all three components are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
 
+> **Migrating from a `claude mcp add` install?** Remove the old entry first: `claude mcp remove python-repl -s user`. Keeping both registers two REPL server processes with duplicate tools (`mcp__python-repl__…` and `mcp__plugin_python-repl_…`) and can skew versions between them.
+
 **What the plugin bundles:**
 
 | Component | What it does |
@@ -41,7 +43,7 @@ To update later: `/plugin marketplace update repl-mcp` then `/plugin update pyth
 ### Claude Code (MCP server only)
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.2.0 repl-mcp
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.3.0 repl-mcp
 ```
 
 Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
@@ -49,7 +51,7 @@ Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.2.0 repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.3.0 repl-mcp
 ```
 
 ### Claude Desktop
@@ -61,7 +63,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.2.0", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.3.0", "repl-mcp"]
     }
   }
 }

@@ -150,7 +150,25 @@ class MCPClientWrapper:
 
     def __dir__(self):
         """Support dir(mcp) introspection."""
-        return ['tools', 'servers', 'list_tools', 'help', 'discover_tools']
+        return ['tools', 'servers', 'call', 'list_tools', 'help', 'discover_tools']
+
+    def call(self, server: str, tool: str, *, timeout: float = 60.0, **kwargs) -> Any:
+        """
+        Call a tool on a connected server (alias for mcp.tools.<server>.<tool>(...)).
+
+        Args:
+            server: Server name (see mcp.servers)
+            tool: Tool name (see mcp.list_tools(server))
+            timeout: Timeout in seconds for the tool call (default: 60s)
+            **kwargs: Tool arguments
+
+        Returns:
+            Tool result (parsed from content)
+
+        Example:
+            >>> mcp.call('github', 'create_issue', owner='me', repo='proj', title='Bug')
+        """
+        return self._invoke_tool(server, tool, timeout=timeout, **kwargs)
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Get or create event loop."""
@@ -402,6 +420,7 @@ class MCPClientWrapper:
                 tools = tool_list.get(srv, [])
                 output += f"  {srv} ({len(tools)} tools)\n"
             output += "\nUse mcp.help('server') to see tools for a specific server"
+            output += "\nCall tools via mcp.call('server', 'tool', **args) or mcp.tools.<server>.<tool>(**args)"
             return output
 
         elif tool is None:

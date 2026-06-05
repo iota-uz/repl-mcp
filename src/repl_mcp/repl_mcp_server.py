@@ -203,7 +203,9 @@ def create_server(
           git        - Git ops: .log(), .diff(), .blame(), .status()
           ast_utils  - Python AST: .find_functions(), .find_classes(), .find_calls()
           code       - Multi-lang (100+ languages): .find_functions(), .find_classes()
-          mcp        - MCP tools: .tools.<server>.<method>(), .servers, .help()
+          mcp        - MCP tools: .call(server, tool, **args), .servers, .help()
+
+        Missing package? Install into the running REPL env: sh('uv pip install <pkg>')
 
         Quick reference:
           %help       - Full documentation and examples

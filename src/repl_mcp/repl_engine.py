@@ -100,6 +100,24 @@ def _smart_truncate(
     )
 
 
+def _format_repl_traceback(exc: BaseException) -> str:
+    """
+    Format a traceback starting at user code (the first <repl> frame).
+
+    Drops the REPL engine's own exec/eval wrapper frames (which leak
+    internal file paths like .../repl_mcp/repl_engine.py) so errors read
+    as if they came directly from the user's snippet. Frames *below* the
+    first <repl> frame (e.g. library code the snippet called into) are kept.
+    Falls back to the full traceback if no <repl> frame is found.
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_filename != "<repl>":
+        tb = tb.tb_next
+    if tb is None:
+        tb = exc.__traceback__
+    return "".join(traceback.format_exception(type(exc), exc, tb))
+
+
 def _detect_common_errors(
     exception: Exception,
     code: str,
@@ -460,7 +478,9 @@ class REPLEngine:
             exception_info = ExceptionInfo(
                 type=type(e).__name__,
                 message=str(e),
-                traceback=traceback.format_exc(),
+                # SyntaxError is raised inside compile() — there is no <repl>
+                # frame, so format the exception only (no engine frames).
+                traceback="".join(traceback.format_exception_only(type(e), e)),
                 context_line=context_line,
                 hints=["Check for missing parentheses, brackets, or quotes"],
                 similar_names=[]
@@ -470,12 +490,13 @@ class REPLEngine:
 
             # Enhanced error detection
             hints, similar_names = _detect_common_errors(e, code, self.globals)
-            context_line = self._extract_error_line_from_traceback(traceback.format_exc())
+            clean_tb = _format_repl_traceback(e)
+            context_line = self._extract_error_line_from_traceback(clean_tb)
 
             exception_info = ExceptionInfo(
                 type=type(e).__name__,
                 message=str(e),
-                traceback=traceback.format_exc(),
+                traceback=clean_tb,
                 context_line=context_line,
                 hints=hints,
                 similar_names=similar_names
@@ -746,7 +767,7 @@ class REPLEngine:
                 exception=ExceptionInfo(
                     type=type(e).__name__,
                     message=str(e),
-                    traceback=traceback.format_exc(),
+                    traceback="".join(traceback.format_exception_only(type(e), e)),
                 ),
                 execution_time_ms=execution_time_ms,
             )
@@ -843,7 +864,7 @@ class REPLEngine:
                 exception=ExceptionInfo(
                     type=type(e).__name__,
                     message=str(e),
-                    traceback=traceback.format_exc(),
+                    traceback="".join(traceback.format_exception_only(type(e), e)),
                 ),
                 execution_time_ms=execution_time_ms,
             )
