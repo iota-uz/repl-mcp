@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
 from typing import Any, Optional
@@ -17,11 +18,52 @@ from mcp.client.streamable_http import streamablehttp_client
 from .models import ServerConfig
 
 
+_ENV_REF = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
+
+
 def _expand_env_value(value: str) -> str:
-    """Expand a full-value ${VAR} reference from the environment."""
-    if value.startswith("${") and value.endswith("}"):
-        return os.environ.get(value[2:-1], "")
-    return value
+    """
+    Expand ${VAR} / ${VAR:-default} references anywhere in the string
+    (Claude Code .mcp.json semantics, e.g. "Bearer ${MY_TOKEN}").
+
+    Unset vars without a default expand to "" with a warning.
+    """
+
+    def repl(m: re.Match) -> str:
+        var, default = m.group(1), m.group(2)
+        if var in os.environ:
+            return os.environ[var]
+        if default is not None:
+            return default
+        logger.warning("Env var %s referenced in config but not set", var)
+        return ""
+
+    return _ENV_REF.sub(repl, value)
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """
+    Human-readable reason for a connect failure.
+
+    anyio task groups wrap the real error (e.g. an HTTP 401) in nested
+    ExceptionGroups whose str() is just "unhandled errors in a TaskGroup" —
+    unwrap to the leaf exceptions instead.
+    """
+    leaves: list[BaseException] = []
+
+    def walk(e: BaseException) -> None:
+        subs = getattr(e, "exceptions", None)  # ExceptionGroup (incl. py3.10 backport)
+        if subs:
+            for sub in subs:
+                walk(sub)
+        else:
+            leaves.append(e)
+
+    walk(exc)
+    reasons = [f"{type(e).__name__}: {e}" for e in leaves[:3]]
+    if len(leaves) > 3:
+        reasons.append(f"... and {len(leaves) - 3} more")
+    return "; ".join(reasons) if reasons else f"{type(exc).__name__}: {exc}"
 
 # Allow nested event loops for sync wrapper.
 # Python 3.14 + anyio can fail when nest_asyncio patches the loop used by
@@ -167,7 +209,7 @@ class MCPClientWrapper:
 
     def __dir__(self):
         """Support dir(mcp) introspection."""
-        return ['tools', 'servers', 'call', 'list_tools', 'help', 'discover_tools']
+        return ['tools', 'servers', 'failed', 'call', 'list_tools', 'help', 'discover_tools']
 
     def call(self, server: str, tool: str, *, timeout: float = 60.0, **kwargs) -> Any:
         """
@@ -318,8 +360,10 @@ class MCPClientWrapper:
                     del self._errlogs[name]
             raise
         except Exception as e:
-            logger.warning("Failed to connect to %s: %s", name, e)
-            self.failed[name] = f"{type(e).__name__}: {e}"
+            reason = _failure_reason(e)
+            logger.warning("Failed to connect to %s: %s", name, reason)
+            logger.debug("Connect failure for %s", name, exc_info=e)
+            self.failed[name] = reason
             if name in self._exit_stacks:
                 await self._exit_stacks[name].aclose()
                 del self._exit_stacks[name]
@@ -378,8 +422,10 @@ class MCPClientWrapper:
                     del self._errlogs[name]
                 return name, False
             except Exception as e:
-                logger.warning("Failed to connect to %s: %s", name, e)
-                self.failed[name] = f"{type(e).__name__}: {e}"
+                reason = _failure_reason(e)
+                logger.warning("Failed to connect to %s: %s", name, reason)
+                logger.debug("Connect failure for %s", name, exc_info=e)
+                self.failed[name] = reason
                 return name, False
 
         results: dict[str, bool] = {}

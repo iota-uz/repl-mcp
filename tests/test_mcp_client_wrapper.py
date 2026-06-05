@@ -1,7 +1,13 @@
 """Tests for MCP client wrapper introspection features."""
 
 import pytest
-from repl_mcp.mcp_client_wrapper import MCPClientWrapper, ToolsContainer, ToolNamespace
+from repl_mcp.mcp_client_wrapper import (
+    MCPClientWrapper,
+    ToolsContainer,
+    ToolNamespace,
+    _expand_env_value,
+    _failure_reason,
+)
 
 
 class TestToolNamespaceIntrospection:
@@ -108,7 +114,7 @@ class TestMCPClientWrapperIntrospection:
         wrapper = MCPClientWrapper()
 
         result = dir(wrapper)
-        expected = ['tools', 'servers', 'call', 'list_tools', 'help', 'discover_tools']
+        expected = ['tools', 'servers', 'failed', 'call', 'list_tools', 'help', 'discover_tools']
         for item in expected:
             assert item in result
 
@@ -236,3 +242,69 @@ class TestIntrospectionIntegration:
         assert result.success
         # Should show type and docstring info
         assert "Type:" in result.stdout or "Docstring:" in result.stdout
+
+
+class TestEnvExpansion:
+    """Tests for ${VAR} expansion in config values (headers, env)."""
+
+    def test_full_value_reference(self, monkeypatch):
+        monkeypatch.setenv("MY_TOKEN", "secret")
+        assert _expand_env_value("${MY_TOKEN}") == "secret"
+
+    def test_embedded_reference(self, monkeypatch):
+        """Bearer ${TOKEN} — the birbozor 401 regression."""
+        monkeypatch.setenv("MY_TOKEN", "secret")
+        assert _expand_env_value("Bearer ${MY_TOKEN}") == "Bearer secret"
+
+    def test_multiple_references(self, monkeypatch):
+        monkeypatch.setenv("A", "1")
+        monkeypatch.setenv("B", "2")
+        assert _expand_env_value("${A}-${B}") == "1-2"
+
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("NOPE", raising=False)
+        assert _expand_env_value("${NOPE:-fallback}") == "fallback"
+
+    def test_env_wins_over_default(self, monkeypatch):
+        monkeypatch.setenv("YEP", "real")
+        assert _expand_env_value("${YEP:-fallback}") == "real"
+
+    def test_unset_without_default_is_empty(self, monkeypatch):
+        monkeypatch.delenv("NOPE", raising=False)
+        assert _expand_env_value("Bearer ${NOPE}") == "Bearer "
+
+    def test_plain_value_untouched(self):
+        assert _expand_env_value("application/json") == "application/json"
+
+
+class TestFailureReason:
+    """Tests for ExceptionGroup unwrapping in connect-failure messages."""
+
+    def test_plain_exception(self):
+        reason = _failure_reason(ValueError("bad config"))
+        assert reason == "ValueError: bad config"
+
+    def test_nested_exception_group_unwraps_to_leaf(self):
+        """anyio wraps the real error (e.g. HTTP 401) in nested groups."""
+        try:
+            from exceptiongroup import ExceptionGroup as EG  # py3.10 backport
+        except ImportError:
+            EG = ExceptionGroup
+        leaf = ConnectionError("401 Unauthorized for url https://x/mcp/")
+        group = EG("unhandled errors in a TaskGroup", [EG("inner", [leaf])])
+
+        reason = _failure_reason(group)
+        assert "401 Unauthorized" in reason
+        assert "TaskGroup" not in reason
+
+    def test_multiple_leaves_capped(self):
+        try:
+            from exceptiongroup import ExceptionGroup as EG
+        except ImportError:
+            EG = ExceptionGroup
+        leaves = [ValueError(f"e{i}") for i in range(5)]
+        group = EG("group", leaves)
+
+        reason = _failure_reason(group)
+        assert "e0" in reason and "e2" in reason
+        assert "and 2 more" in reason
