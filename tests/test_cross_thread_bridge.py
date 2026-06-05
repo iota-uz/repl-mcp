@@ -45,7 +45,7 @@ async def test_list_tools_from_worker_thread(connected_wrapper):
     result = await asyncio.wait_for(
         loop.run_in_executor(None, connected_wrapper.list_tools), timeout=GUARD_S
     )
-    assert result == {"child": ["echo"]}
+    assert result == {"child": ["echo", "slow"]}
 
 
 @pytest.mark.asyncio
@@ -55,7 +55,7 @@ async def test_help_from_worker_thread(connected_wrapper):
     result = await asyncio.wait_for(
         loop.run_in_executor(None, connected_wrapper.help), timeout=GUARD_S
     )
-    assert "child (1 tools)" in result
+    assert "child (2 tools)" in result
     assert ".mcp.json" in result  # scope note present
 
 

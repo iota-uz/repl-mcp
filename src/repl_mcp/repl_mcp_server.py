@@ -1,24 +1,24 @@
 """FastMCP server exposing stateful Python REPL."""
 
-import asyncio
 import sys
 import json
 import argparse
 import logging
 
-import anyio.to_thread
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastmcp import FastMCP
 
-from .repl_engine import REPLEngine
+from .repl_engine import REPLEngine  # noqa: F401  (re-export for tests/embedders)
 from .mcp_client_wrapper import MCPClientWrapper
+from .kernel.supervisor import KernelSupervisor
 
 # Global instances
 mcp_wrapper: Optional[MCPClientWrapper] = None
-repl_engine: Optional[REPLEngine] = None
+kernel: Optional[KernelSupervisor] = None
+repl_engine = None  # set by tests that drive the engine in-process
 
 
 def setup_logging(debug: bool = False) -> logging.Logger:
@@ -92,53 +92,51 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
     @asynccontextmanager
     async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         """Lifespan context manager for the REPL MCP server."""
-        global mcp_wrapper, repl_engine
-        autoconnect_task = None
+        global mcp_wrapper, kernel
 
         # --- STARTUP ---
         logger.info("Initializing REPL MCP server...")
 
-        # Initialize MCP wrapper
         mcp_wrapper = MCPClientWrapper()
 
-        # Initialize REPL engine with workspace root
-        repl_engine = REPLEngine(
+        # LAZY autoconnect: configured servers connect on the first mcp.*
+        # use inside the REPL — most sessions never touch the bridge, so
+        # they spawn zero child MCP servers.
+        connect_servers = None
+        if autoconnect_enabled:
+            async def connect_servers():
+                servers = filter_servers(
+                    load_mcp_config(config_path), exclude=["python-repl"]
+                )
+                if not servers:
+                    return
+                logger.info(
+                    "Connecting to %d MCP servers (first mcp.* use)...", len(servers)
+                )
+                results = await mcp_wrapper.connect_async(
+                    servers, timeout_s=20.0, sequential=True
+                )
+                for name, success in results.items():
+                    logger.info("  %s %s", "✓" if success else "✗", name)
+
+        kernel = KernelSupervisor(
             mcp_wrapper=mcp_wrapper,
             workspace_root=Path.cwd(),
+            connect_servers=connect_servers,
         )
-
-        # Auto-connect to configured servers
-        if autoconnect_enabled:
-            servers = load_mcp_config(config_path)
-
-            # Filter out self to prevent recursive connection
-            servers = filter_servers(servers, exclude=["python-repl"])
-
-            if servers:
-                logger.info(f"Auto-connecting to {len(servers)} MCP servers (background)...")
-
-                async def do_connect():
-                    # Use sequential connects by default to reduce startup load.
-                    results = await mcp_wrapper.connect_async(servers, timeout_s=20.0, sequential=True)
-                    for name, success in results.items():
-                        status = "✓" if success else "✗"
-                        logger.info(f"  {status} {name}")
-
-                autoconnect_task = asyncio.create_task(do_connect())
+        await kernel.start()
 
         # Yield control - server runs here
         yield {}
 
         # --- SHUTDOWN ---
-        if autoconnect_task and not autoconnect_task.done():
-            autoconnect_task.cancel()
-            with suppress(BaseException):
-                await autoconnect_task
         try:
             logger.info("Shutting down REPL MCP server...")
         except ValueError:
             # File may be closed during stdio shutdown
             pass
+        if kernel:
+            await kernel.shutdown()
         if mcp_wrapper:
             mcp_wrapper.disconnect()
 
@@ -175,11 +173,9 @@ def create_server(
     # Adding `-> str` causes FastMCP to wrap output in {"result": "..."} JSON
     # via structuredContent. We want plain text output for better readability.
     #
-    # NOTE: async + to_thread offload intentionally! FastMCP runs sync tools
-    # inline on the event loop thread, so long REPL executions froze the whole
-    # server (autoconnect starved, protocol handling blocked). Offloading also
-    # means mcp bridge calls always come from a worker thread and take the
-    # loop-affine run_coroutine_threadsafe path in MCPClientWrapper.
+    # NOTE: pure-async handler — execution happens in the kernel CHILD
+    # process; this just awaits the IPC result, so the server's event loop
+    # is never blocked by REPL code.
     @mcp_server.tool()
     async def execute_python(
         code: str,
@@ -216,12 +212,7 @@ def create_server(
         Returns:
             Plain text output (stdout, return value, or error message)
         """
-        if reset:
-            repl_engine.reset_namespace()
-
-        result = await anyio.to_thread.run_sync(
-            lambda: repl_engine.execute(code, timeout=timeout)
-        )
+        result = await kernel.execute(code, timeout=timeout, reset=reset)
         return str(result)
 
     return mcp_server

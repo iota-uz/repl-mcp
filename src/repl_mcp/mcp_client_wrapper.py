@@ -9,7 +9,6 @@ import sys
 from typing import Any, Optional
 from contextlib import AsyncExitStack
 
-import nest_asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
@@ -65,12 +64,6 @@ def _failure_reason(exc: BaseException) -> str:
         reasons.append(f"... and {len(leaves) - 3} more")
     return "; ".join(reasons) if reasons else f"{type(exc).__name__}: {exc}"
 
-# Allow nested event loops for sync wrapper.
-# Python 3.14 + anyio can fail when nest_asyncio patches the loop used by
-# FastMCP server startup, so skip auto-patching there.
-if sys.version_info < (3, 14):
-    nest_asyncio.apply()
-
 logger = logging.getLogger(__name__)
 
 
@@ -81,13 +74,12 @@ class MCPClientWrapper:
         self._sessions: dict[str, ClientSession] = {}
         self._exit_stacks: dict[str, AsyncExitStack] = {}
         self._errlogs: dict[str, Any] = {}  # Track errlog file handles
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Loop the sessions were created on. Sessions (and their anyio
         # streams/tasks) are loop-affine: every await on them MUST run on
-        # this loop. REPL code executes on a worker thread (FastMCP runs
-        # sync tools via anyio.to_thread), so _run_async routes coroutines
-        # back to this loop with run_coroutine_threadsafe. Without this,
-        # any mcp.* call from the REPL deadlocks forever.
+        # this loop. In v2 the callers are executor threads (the kernel
+        # supervisor's RPC handlers), so _run_async routes coroutines back
+        # to this loop with run_coroutine_threadsafe. Awaiting a session
+        # from any other loop deadlocks (the historical mcp.help() hang).
         self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
         # Connection failures by server name (reason string), for help()/servers
         self.failed: dict[str, str] = {}
@@ -128,32 +120,19 @@ class MCPClientWrapper:
         """
         return self._invoke_tool(server, tool, timeout=timeout, **kwargs)
 
-    def _get_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create event loop."""
-        if self._loop is None or self._loop.is_closed():
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                self._loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self._loop)
-        return self._loop
-
     def _run_async(self, coro, timeout: Optional[float] = 30.0):
         """
-        Run async coroutine in sync context.
+        Run an async coroutine from sync code.
 
-        Sessions are bound to the event loop they were connected on
-        (self._owner_loop). When called from a different thread — the normal
-        case: execute_python offloads REPL execution to a worker thread
-        (anyio.to_thread) while the sessions live on the server's main loop —
-        the coroutine is scheduled onto the owner loop thread-safely. Awaiting
-        a session from any other loop deadlocks (anyio streams never wake
-        cross-loop), which is exactly the historical mcp.help() hang.
+        Two supported contexts:
+        - Sessions connected (owner loop running) and we're on a different
+          thread: schedule onto the owner loop thread-safely. This is the
+          normal v2 path (kernel RPC handlers run in executor threads).
+        - No owner loop yet (nothing connected): run on a private loop —
+          covers introspection like list_tools() before any connect.
 
-        Args:
-            coro: Coroutine to run
-            timeout: Max seconds to wait for the result when routing to the
-                     owner loop (None = wait forever; avoid)
+        Calling from the owner loop's own thread is a programming error
+        (it would deadlock) and raises immediately.
         """
         owner = self._owner_loop
         if owner is not None and owner.is_running():
@@ -161,29 +140,22 @@ class MCPClientWrapper:
                 running = asyncio.get_running_loop()
             except RuntimeError:
                 running = None
-            if running is not owner:
-                future = asyncio.run_coroutine_threadsafe(coro, owner)
-                try:
-                    return future.result(timeout=timeout)
-                except TimeoutError:
-                    future.cancel()
-                    raise TimeoutError(
-                        f"MCP bridge call timed out after {timeout}s"
-                    ) from None
-            # Same loop and it's running: fall through to nest_asyncio path.
-
-        loop = self._get_loop()
-        # With nest_asyncio, we can always use run_until_complete
-        # even when the loop is already running
-        try:
-            return loop.run_until_complete(coro)
-        except RuntimeError:
-            # Fallback to creating new loop
-            new_loop = asyncio.new_event_loop()
+            if running is owner:
+                raise RuntimeError(
+                    "mcp bridge: sync call on the owner event loop thread "
+                    "would deadlock — await the async API instead"
+                )
+            future = asyncio.run_coroutine_threadsafe(coro, owner)
             try:
-                return new_loop.run_until_complete(coro)
-            finally:
-                new_loop.close()
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                future.cancel()
+                raise TimeoutError(
+                    f"MCP bridge call timed out after {timeout}s"
+                ) from None
+
+        # Nothing connected yet: private loop is safe (no loop-affine state)
+        return asyncio.run(coro)
 
     async def _connect_server(self, name: str, config: ServerConfig) -> bool:
         """Connect to a single MCP server."""
