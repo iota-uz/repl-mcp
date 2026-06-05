@@ -1,24 +1,21 @@
 # Stateful Python REPL MCP Server
 
-A Model Context Protocol (MCP) server that provides a stateful Python REPL with programmatic access to other MCP tools. Execute Python code persistently and call external MCP servers (like GitHub, Playwright, etc.) directly from your code via a pre-injected `mcp` client object.
+A Model Context Protocol (MCP) server giving AI agents a **persistent Python REPL** with honest execution semantics. Code runs in a subprocess kernel (Jupyter-style): variables survive across calls, runaway code is interruptible without losing state, and crashes never take the server down. Other MCP servers from your project's `.mcp.json` are callable in-code via a pre-injected `mcp` bridge.
 
 ## Features
 
-- **Stateful Execution**: Variables, imports, and function definitions persist across executions (~0.1s warm calls vs ~3s per fresh `python3 -c` spawn)
-- **Shell Composition**: Pre-injected `sh()` helper — `json.loads(sh("gh pr view 1 --json title"))` replaces `cmd | python3 -c` pipelines
-- **Full Filesystem Access**: `open()`, absolute paths, and `~` all work; `workspace.*` helpers accept them too
-- **Codebase Utilities**: `workspace` (files), `git` (structured log/diff/blame), `ast_utils` (Python AST), `code` (100+ languages via tree-sitter)
-- **MCP Tool Integration**: Call other MCP tools programmatically via `mcp.call("server", "tool", **args)` or `mcp.tools.server.method(...)`
-- **Auto-connect**: Automatically connect to MCP servers from `.mcp.json` on startup
-- **Output Capture**: Full stdout, stderr, exceptions, and return values
-- **HTTP & Stdio Transports**: Default HTTP/SSE on port 8000, with stdio fallback for Claude Desktop
-- **No Sandboxing**: Full Python access (intended for local use only)
+- **Persistent State**: variables, imports, and functions survive across calls (~0.1s warm calls vs ~3s per fresh `python3` spawn)
+- **Real Timeouts**: runaway code (sync *or* async) is interrupted at `timeout` seconds — KeyboardInterrupt, **namespace state preserved**. Cells that swallow the interrupt are killed and the kernel respawns with an explicit "variables cleared" notice
+- **Crash Isolation**: a segfault/OOM in REPL code kills only the kernel child; the server respawns it instantly
+- **Top-level `await`**: `await client.get(url)` directly — no `asyncio.run()` wrapper
+- **Shell Composition**: pre-injected `sh()` helper — `json.loads(sh("gh pr view 1 --json title"))` replaces `cmd | python3 -c` pipelines
+- **Full Filesystem Access**: `open()`, absolute paths, and `~` all work; cwd is your project
+- **MCP Bridge**: `mcp.call("server", "tool", **args)` reaches the servers in your project's `.mcp.json` — connected **lazily** on first use, with failures visible in `mcp.failed` / `mcp.help()`
+- **Claude Code Plugin**: one install bundles the server, a usage skill, and a Bash-nudge hook
 
 ## Installation
 
-### Claude Code Plugin (Recommended)
-
-The plugin bundles the MCP server, a usage skill, and a nudge hook in one install:
+### Claude Code (plugin — recommended)
 
 ```bash
 # In Claude Code:
@@ -28,22 +25,22 @@ The plugin bundles the MCP server, a usage skill, and a nudge hook in one instal
 
 Restart the session and all three components are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
 
-> **Migrating from a `claude mcp add` install?** Remove the old entry first: `claude mcp remove python-repl -s user`. Keeping both registers two REPL server processes with duplicate tools (`mcp__python-repl__…` and `mcp__plugin_python-repl_…`) and can skew versions between them.
+> **Migrating from a `claude mcp add` install?** Remove the old entry first: `claude mcp remove python-repl -s user`. Keeping both registers two REPL server processes with duplicate tools and can skew versions between them.
 
 **What the plugin bundles:**
 
 | Component | What it does |
 |---|---|
 | **MCP server** | `execute_python` tool, launched via `uvx` pinned to the release tag (cached after first run; the REPL's working directory is your project, not the plugin cache) |
-| **Skill** (`python-repl`) | Teaches Claude when to reach for the REPL (instead of `python3 -c` / heredocs via Bash) and its gotchas — truncation limits, `inject`, git defaults, regex patterns |
+| **Skill** (`python-repl`) | Teaches Claude when to reach for the REPL (instead of `python3 -c` / heredocs via Bash) and its gotchas — truncation limits, lazy mcp bridge, package installs |
 | **Nudge hook** (PostToolUse) | When Claude runs inline Python through Bash (`python3 -c`, `python3 - <<EOF`, `cmd \| python3`), injects a non-blocking reminder to use `execute_python`. Silent on `python3 script.py`, `python3 -m ...`, `pytest` |
 
-To update later: `/plugin marketplace update repl-mcp` then `/plugin update python-repl@repl-mcp`. To disable just the nudge: uninstall and reinstall isn't needed — disable the hook in `/hooks`, or remove the plugin and use the MCP-only install below.
+To update later: `/plugin marketplace update repl-mcp` then `/plugin update python-repl@repl-mcp`.
 
 ### Claude Code (MCP server only)
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.3.0 repl-mcp
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.0.0 repl-mcp
 ```
 
 Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
@@ -51,7 +48,7 @@ Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v1.3.0 repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.0.0 repl-mcp
 ```
 
 ### Claude Desktop
@@ -63,405 +60,78 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v1.3.0", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.0.0", "repl-mcp"]
     }
   }
 }
 ```
 
-### Manual Installation
-
-<details>
-<summary>For development or running standalone</summary>
-
-**Prerequisites:** Install [UV](https://docs.astral.sh/uv/):
+### Manual (development)
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/iota-uz/repl-mcp && cd repl-mcp
+uv sync --extra dev
+uv run repl-mcp                  # stdio transport (the only transport)
 ```
 
-**Setup:**
+## Usage
 
-```bash
-git clone https://github.com/iota-uz/repl-mcp
-cd repl-mcp
-uv sync
-uv run repl-mcp --help
-```
-
-</details>
-
-## Quick Start
-
-### 1. Configure MCP Servers (Optional)
-
-Create `.mcp.json` in the project root to auto-connect to MCP servers on startup:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "${GH_TOKEN}"
-      }
-    },
-    "playwright": {
-      "url": "http://localhost:3001/sse"
-    }
-  }
-}
-```
-
-### 2. Start the Server
-
-```bash
-# Using UV (recommended - handles dependencies automatically)
-uv run repl-mcp --port 8000
-
-# Or activate venv first
-source .venv/bin/activate
-repl-mcp --port 8000
-
-# Stdio mode (for Claude Desktop integration)
-uv run repl-mcp --transport stdio
-```
-
-### 3. Use from Claude Code
-
-The server exposes one MCP tool:
-
-- `execute_python(code, reset=False, timeout=120, inject=None)` - Execute Python in a persistent REPL
-
-Inside the REPL, use `%help` for documentation, `object?` for quick help (e.g. `sh?`), and `%who` to list variables.
-
-## Usage Examples
-
-### Shell + Python in One Call
-
-The `sh()` helper returns stdout as a `str` subclass with `.returncode`, `.stderr`, and `.ok`:
+One tool: `execute_python(code, reset=False, timeout=120)`.
 
 ```python
-execute_python(code="""
-import json
+# State persists across calls
+execute_python(code="import httpx; data = (await httpx.AsyncClient().get(url)).json()")
+execute_python(code="len(data['items'])")          # → 42
 
-# Replaces: gh pr view 2822 --json statusCheckRollup | python3 -c "..."
-d = json.loads(sh("gh pr view 2822 --json statusCheckRollup"))
-for c in d["statusCheckRollup"]:
-    print(c["name"], c["conclusion"])
+# Shell composition
+execute_python(code="prs = json.loads(sh('gh pr list --json number,title'))")
 
-# Inspect failures without raising
-r = sh("pytest -q", check=False)
-if not r.ok:
-    print(r.returncode, r.stderr[-500:])
-""")
+# MCP bridge (lazy-connects to your project's .mcp.json on first use)
+execute_python(code="print(mcp.help())")
+execute_python(code="mcp.call('github', 'create_issue', owner='me', repo='proj', title='Bug')")
+
+# Runaway code? Interrupted at timeout, state survives:
+execute_python(code="while True: pass", timeout=5)
+# → KeyboardInterrupt: execution interrupted. Namespace state ... preserved.
+
+# Missing package? Install into the running env:
+execute_python(code="sh('uv pip install openpyxl')")
 ```
 
-### Full Filesystem Access
+Notes:
+- The `mcp` bridge sees **only** the project's `.mcp.json` servers. Host-level connectors (claude.ai Notion/GitHub, user-scope `claude mcp add` servers) are not reachable — call those tools directly.
+- `mcp.call` arguments must be JSON-serializable (they cross the kernel process boundary).
+- Output truncates at 50KB (stdout) / 20KB (return values) — aggregate in-REPL.
+- `reset=True` clears variables but keeps `sh`/`mcp`.
 
-```python
-execute_python(code="""
-import json
-
-# Absolute paths and ~ work everywhere — open(), workspace, glob
-raw = json.load(open("/tmp/data.json"))
-logs = workspace.glob("~/logs/**/*.txt")
-workspace.write("/tmp/summary.json", json.dumps({"n": len(logs)}))
-""")
-```
-
-### Basic Execution with State Persistence
-
-```python
-# First execution
-execute_python(code="x = 42")
-
-# Variable persists in next execution
-execute_python(code="print(x)")  # Output: 42
-
-# Functions and imports persist too
-execute_python(code="""
-import json
-
-def greet(name):
-    return f"Hello, {name}!"
-""")
-
-execute_python(code="print(greet('World'))")  # Output: Hello, World!
-```
-
-### Using Auto-connected MCP Servers
-
-If you have `.mcp.json` configured, servers are automatically available:
-
-```python
-# GitHub already connected via .mcp.json
-execute_python(code="""
-# Discover available tools
-tools = mcp.discover_tools()
-print(f"Connected servers: {list(tools.keys())}")
-""")
-
-# Call GitHub tools directly
-execute_python(code="""
-result = mcp.tools.github.create_issue(
-    owner="myuser",
-    repo="myrepo",
-    title="Test issue from REPL",
-    body="This was created programmatically!"
-)
-print(f"Created issue: {result}")
-""")
-```
-
-### Runtime Connection to MCP Servers
-
-You can also connect to servers dynamically without `.mcp.json`:
-
-```python
-# Connect to GitHub at runtime
-connect_mcp_servers(servers={
-    "github": {
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-github"],
-        "env": {
-            "GITHUB_TOKEN": "${GH_TOKEN}"
-        }
-    }
-})
-
-# List what's available
-list_connected_servers()
-
-# Use the connected server
-execute_python(code="""
-issues = mcp.tools.github.list_issues(
-    owner="myuser",
-    repo="myrepo",
-    state="open"
-)
-print(f"Open issues: {len(issues)}")
-""")
-```
-
-### Bulk Operations with MCP Tools
-
-```python
-# Create multiple GitHub issues programmatically
-execute_python(code="""
-for i in range(5):
-    result = mcp.tools.github.create_issue(
-        owner="myuser",
-        repo="myrepo",
-        title=f"Auto-generated issue {i}",
-        body=f"This is issue number {i}"
-    )
-    print(f"Created: {result['url']}")
-""")
-```
-
-### Error Handling
-
-```python
-# Execution continues after errors
-execute_python(code="1 / 0")  # Returns exception info
-
-# Namespace is preserved
-execute_python(code="print(x)")  # Still works, x=42 from earlier
-```
-
-### Reset Namespace
-
-```python
-# Reset clears all variables except 'mcp'
-execute_python(code="y = 100", reset=True)
-
-# Previous variables are gone
-execute_python(code="print(x)")  # Error: x not defined
-
-# But mcp object is preserved
-execute_python(code="print(mcp.discover_tools())")  # Still works
-```
-
-## Configuration
-
-### Command Line Options
-
-```bash
-repl-mcp --help
-
-Options:
-  --transport {stdio,sse}  Transport type (default: sse)
-  --port PORT              Port for SSE transport (default: 8000)
-  --host HOST              Host for SSE transport (default: 0.0.0.0)
-  --config PATH            Path to .mcp.json config (default: .mcp.json)
-  --no-autoconnect         Disable auto-connecting to servers from .mcp.json
-```
-
-### Environment Variables
-
-- `GH_TOKEN` - GitHub personal access token (if using GitHub MCP)
-- Other environment variables as required by your MCP servers
-
-## Architecture
+## Architecture (v2: subprocess kernel)
 
 ```
-Claude ←→ FastMCP Server ←→ REPL Engine ←→ MCP Client Wrapper ←→ External MCP Servers
-         (execute_python)    (exec code)    (tool calling)         (github, etc)
+MCP client ── stdio ──► PARENT (FastMCP, pure async)        CHILD (owns namespace)
+                          execute_python ── EXECUTE ──────►  exec / await cell
+                                       ◄──── RESULT ──────   captured output
+                          timeout: SIGINT ────────────────►  KeyboardInterrupt
+                          crash: respawn + clear notice      (state survives)
+                          MCP sessions (lazy)  ◄─ MCP_CALL ─ in-code mcp.* proxy
 ```
 
-### Components
+The server's event loop never blocks on REPL code; in-cell `mcp.*` calls are serviced on an independent channel while the cell runs. See `CLAUDE.md` for the full development guide.
 
-- **repl_mcp_server.py** - FastMCP server exposing tools
-- **repl_engine.py** - Stateful execution with persistent namespace
-- **mcp_client_wrapper.py** - Sync wrapper over async MCP SDK
-- **models.py** - Pydantic data models
+## v2.0.0 breaking changes
 
-### Key Design Decisions
-
-1. **UV for Portability** - Single command execution, automatic dependency management
-2. **Hybrid MCP Config** - Support `.mcp.json` auto-connect + runtime `connect_mcp_servers()`
-3. **Clean Namespace** - Only `mcp` object pre-injected (no library preloading)
-4. **HTTP First** - Default SSE transport, stdio as fallback
-5. **Sync MCP Wrapper** - Async SDK wrapped with sync API for REPL convenience
-6. **Dynamic Tool Access** - Intuitive `mcp.tools.server.method(...)` syntax
-7. **Unrestricted Execution** - Full Python access (local use only)
-8. **Structured Output** - Always return structured JSON, never throw to MCP layer
-
-## API Reference
-
-### execute_python
-
-Execute Python code in a persistent REPL environment with pre-injected utilities.
-
-**Parameters:**
-- `code` (str): Python code to execute
-- `reset` (bool, optional): Reset namespace before execution (default: False)
-- `timeout` (float, optional): Max execution seconds (default: 120)
-- `inject` (dict, optional): Variables to inject into namespace
-
-**Returns:**
-```python
-{
-    "success": bool,
-    "stdout": str,
-    "stderr": str,
-    "return_value": str | None,
-    "exception": {
-        "type": str,
-        "message": str,
-        "traceback": str,
-        "hints": list[str],         # Helpful suggestions
-        "similar_names": list[str]  # For typo detection
-    } | None,
-    "execution_time_ms": float,
-    "namespace_vars": dict[str, str],
-    "warnings": list[{
-        "category": str,
-        "message": str,
-        "suggestion": str
-    }]
-}
-```
-
-**REPL Features:**
-- `%help` - Full documentation
-- `object?` - Quick docstring (IPython-style)
-- `%who` / `%whos` - List variables
-- `%history` - Execution history
-- `%reset` - Clear namespace
-
-## Security Warning
-
-⚠️ **WARNING**: This server executes arbitrary Python code without restrictions.
-
-- **Local use only** - Do not expose to network
-- **Single user** - No authentication or isolation
-- **Full system access** - Can read/write files, make network calls, run commands
-- For production use, run in isolated container with resource limits
+- **Removed** (zero observed usage across real agent transcripts): `workspace`/`git`/`ast_utils`/`code` pre-injected utilities (use `open()`/`pathlib`/`sh('git …')`), `%magic` commands and `object?` queries, the `inject` parameter, `mcp.tools.<server>.<tool>` dot-style access and `discover_tools()` (use `mcp.call`/`mcp.list_tools`), SSE transport (stdio only)
+- **Changed**: execution moved to a subprocess kernel — `timeout` is now actually enforced; kernel restarts are reported explicitly
+- **Added**: top-level `await`, `mcp.failed`, lazy MCP connect
+- Install footprint dropped ~350MB (tree-sitter removed)
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Install dev dependencies
-uv sync --extra dev
-
-# Run unit tests
-uv run pytest tests/
-
-# Run specific test file
-uv run pytest tests/test_repl_engine.py -v
-
-# Run example scripts (integration tests)
-bash examples/run_all_examples.sh
+uv run pytest tests/ -v          # full suite
 ```
 
-### Project Structure
-
-```
-repl_mcp/
-├── .claude-plugin/
-│   ├── plugin.json            # Plugin manifest (MCP server + skill + hook)
-│   └── marketplace.json       # Makes the repo installable as a marketplace
-├── skills/python-repl/
-│   └── SKILL.md               # Usage skill shipped with the plugin
-├── hooks/
-│   ├── hooks.json             # PostToolUse hook config
-│   └── nudge-python-repl.sh   # Nudges Claude toward execute_python
-├── src/repl_mcp/
-│   ├── models.py              # Pydantic data models
-│   ├── repl_engine.py         # Stateful execution engine
-│   ├── mcp_client_wrapper.py  # Sync MCP client wrapper
-│   ├── repl_mcp_server.py     # FastMCP server
-│   └── utilities/
-│       ├── workspace.py       # File access (full FS, absolute/~ paths)
-│       ├── shell.py           # sh() helper (ShellResult / ShellError)
-│       ├── git_utils.py       # Structured git operations
-│       ├── ast_utils.py       # Python AST analysis
-│       └── code_utils.py      # Multi-language analysis (tree-sitter)
-├── tests/
-├── examples/
-├── .mcp.dev.json              # Dev-only autoconnect config for this repo
-├── pyproject.toml             # UV project config
-└── README.md
-```
-
-**Release process** (for maintainers): bump `version` in `pyproject.toml` and `.claude-plugin/plugin.json`, update the `@vX.Y.Z` tag ref in plugin.json's `mcpServers`, then tag and push. Hook/skill-only changes need only a plugin.json version bump (the MCP server stays pinned to its tag).
-
-## Troubleshooting
-
-### Server won't start
-
-- Check UV is installed: `uv --version`
-- Try `uv sync` to reinstall dependencies
-- Check port 8000 is not in use: `lsof -i :8000`
-
-### Can't connect to MCP server
-
-- Verify server command is correct in `.mcp.json`
-- Check required environment variables are set
-- Look for connection errors in server output
-- Try connecting manually: `npx -y @modelcontextprotocol/server-github`
-
-### Execution fails
-
-- Check for syntax errors in code
-- Verify imports are available (install packages in REPL: `execute_python(code="!pip install requests")`)
-- Review exception traceback in result
-
-### Tools not available
-
-- Ensure server connected successfully: `list_connected_servers()`
-- Check server is running (for HTTP/SSE servers)
-- Verify authentication (e.g., GH_TOKEN for GitHub)
+See `CLAUDE.md` for architecture details, test map, gotchas, and the release process.
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open issues for bugs or feature requests.
