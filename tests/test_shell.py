@@ -103,12 +103,6 @@ class TestShellInEngine:
         assert result.success
         assert "still-here" in result.return_value
 
-    def test_sh_help_query_shows_docstring(self):
-        engine = REPLEngine()
-        result = engine.execute("sh?")
-        assert result.success
-        assert "shell command" in result.stdout.lower() or "shell command" in (result.return_value or "").lower()
-
     def test_sh_default_cwd_is_workspace_root(self, tmp_path):
         engine = REPLEngine(workspace_root=tmp_path)
         result = engine.execute("sh('pwd').strip()")

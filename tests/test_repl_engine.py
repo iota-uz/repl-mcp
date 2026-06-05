@@ -304,14 +304,14 @@ class TestEnhancedErrors:
         assert result.exception is not None
         assert 'my_variable' in result.exception.similar_names
 
-    def test_file_error_suggests_workspace(self):
-        """Test FileNotFoundError suggests workspace methods."""
+    def test_file_error_has_path_hint(self):
+        """Test FileNotFoundError includes a path-checking hint."""
         engine = REPLEngine()
-        result = engine.execute('open("nonexistent.txt")')
+        result = engine.execute("open('/nonexistent/path/file.txt')")
 
         assert not result.success
-        assert result.exception is not None
-        assert any('workspace.read' in hint for hint in result.exception.hints)
+        assert result.exception.type == "FileNotFoundError"
+        assert any("exists" in h for h in result.exception.hints)
 
     def test_syntax_error_includes_context(self):
         """Test syntax error includes context line."""
@@ -408,179 +408,6 @@ class TestBackwardsCompatibility:
         assert 'success' in result_dict
         assert 'warnings' in result_dict
         assert 'stdout_info' in result_dict
-
-
-class TestMagicCommands:
-    """Tests for IPython-style magic commands."""
-
-    def test_magic_who(self):
-        """Test %who lists variable names."""
-        engine = REPLEngine()
-        engine.execute("x = 1; y = 2")
-        result = engine.execute("%who")
-        assert result.success
-        assert "x" in result.stdout
-        assert "y" in result.stdout
-
-    def test_magic_who_empty(self):
-        """Test %who with no variables."""
-        engine = REPLEngine()
-        result = engine.execute("%who")
-        assert result.success
-        assert "no variables" in result.stdout.lower()
-
-    def test_magic_whos(self):
-        """Test %whos shows detailed variable listing."""
-        engine = REPLEngine()
-        engine.execute("x = 42; y = 'hello'")
-        result = engine.execute("%whos")
-        assert result.success
-        assert "int" in result.stdout
-        assert "str" in result.stdout
-        assert "42" in result.stdout
-
-    def test_magic_reset(self):
-        """Test %reset clears namespace but keeps utilities."""
-        engine = REPLEngine()
-        engine.execute("x = 42")
-        result = engine.execute("%reset")
-        assert result.success
-        assert "reset" in result.stdout.lower()
-        
-        # Variable should be gone
-        result = engine.execute("x")
-        assert not result.success
-
-    def test_magic_env(self):
-        """Test %env shows environment info."""
-        engine = REPLEngine()
-        result = engine.execute("%env")
-        assert result.success
-        assert "Workspace:" in result.stdout
-
-    def test_magic_timeit(self):
-        """Test %timeit times code execution."""
-        engine = REPLEngine()
-        result = engine.execute("%timeit sum(range(100))")
-        assert result.success
-        assert "per loop" in result.stdout
-
-    def test_magic_timeit_empty(self):
-        """Test %timeit with no code shows usage."""
-        engine = REPLEngine()
-        result = engine.execute("%timeit")
-        assert result.success
-        assert "Usage:" in result.stdout
-
-    def test_magic_help(self):
-        """Test %help shows REPL help."""
-        engine = REPLEngine()
-        result = engine.execute("%help")
-        assert result.success
-        assert "Magic commands:" in result.stdout
-        assert "workspace" in result.stdout.lower()
-
-    def test_unknown_magic(self):
-        """Test unknown magic command returns error."""
-        engine = REPLEngine()
-        result = engine.execute("%unknown_command")
-        assert not result.success
-        assert "Unknown magic" in result.stderr
-
-    def test_magic_case_insensitive(self):
-        """Test magic commands are case-insensitive."""
-        engine = REPLEngine()
-        result = engine.execute("%WHO")
-        assert result.success
-
-        result = engine.execute("%Help")
-        assert result.success
-
-    def test_magic_history(self):
-        """Test %history shows execution history."""
-        engine = REPLEngine()
-        engine.execute("x = 1")
-        engine.execute("y = 2")
-        engine.execute("z = x + y")
-        result = engine.execute("%history")
-        assert result.success
-        assert "x = 1" in result.stdout
-        assert "y = 2" in result.stdout
-        assert "z = x + y" in result.stdout
-
-    def test_magic_history_with_count(self):
-        """Test %history n shows last n entries."""
-        engine = REPLEngine()
-        engine.execute("a = 1")
-        engine.execute("b = 2")
-        engine.execute("c = 3")
-        result = engine.execute("%history 2")
-        assert result.success
-        assert "a = 1" not in result.stdout  # Too old
-        assert "b = 2" in result.stdout
-        assert "c = 3" in result.stdout
-
-    def test_magic_history_empty(self):
-        """Test %history with no history."""
-        engine = REPLEngine()
-        result = engine.execute("%history")
-        assert result.success
-        assert "no history" in result.stdout.lower()
-
-
-class TestHelpQueries:
-    """Tests for IPython-style ? help queries."""
-
-    def test_help_query_single_question(self):
-        """Test object? shows docstring."""
-        engine = REPLEngine()
-        result = engine.execute("workspace?")
-        assert result.success
-        assert "Type:" in result.stdout
-        assert "Docstring:" in result.stdout
-
-    def test_help_query_method(self):
-        """Test object.method? shows method docstring."""
-        engine = REPLEngine()
-        result = engine.execute("workspace.read?")
-        assert result.success
-        assert "Type:" in result.stdout
-        assert "Signature:" in result.stdout
-
-    def test_help_query_double_question(self):
-        """Test object?? attempts to show source."""
-        engine = REPLEngine()
-        result = engine.execute("workspace??")
-        assert result.success
-        # May or may not have source depending on compiled state
-        assert "Type:" in result.stdout
-
-    def test_help_query_undefined(self):
-        """Test ? on undefined name returns error."""
-        engine = REPLEngine()
-        result = engine.execute("undefined_var?")
-        assert not result.success
-        assert "not found" in result.stderr.lower()
-
-    def test_help_query_empty(self):
-        """Test just ? shows general help."""
-        engine = REPLEngine()
-        result = engine.execute("?")
-        assert result.success
-        assert "Magic commands:" in result.stdout
-
-    def test_help_query_user_defined(self):
-        """Test ? on user-defined function."""
-        engine = REPLEngine()
-        engine.execute('''
-def my_function(x, y):
-    """Add two numbers together."""
-    return x + y
-''')
-        result = engine.execute("my_function?")
-        assert result.success
-        assert "Add two numbers" in result.stdout
-        assert "Signature:" in result.stdout
 
 
 class TestTopLevelAwait:

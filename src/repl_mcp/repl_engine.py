@@ -17,7 +17,7 @@ from .models import ExecutionResult, ExceptionInfo, TruncationInfo, WarningInfo
 # and preserved during reset
 RESERVED_NAMES = frozenset({
     "__builtins__", "__name__", "__doc__", "__package__",
-    "mcp", "workspace", "git", "ast_utils", "code", "sh",
+    "mcp", "sh",
 })
 
 # Output size limits (characters)
@@ -166,16 +166,12 @@ def _detect_common_errors(
             obj_type = match.group(1)
             attr_name = match.group(2)
 
-            # Check for common mistakes with injected utilities
-            if obj_type == "Workspace" and attr_name in ["open", "file"]:
-                hints.append("Use workspace.read(path) to read files")
-            elif obj_type == "GitUtils" and attr_name == "commits":
-                hints.append("Use git.log(n=10) to get commits")
+            pass  # similar-name suggestions handled below
 
     # FileNotFoundError: suggest existence checks
     elif exc_type == "FileNotFoundError":
-        if "open" in code or "Path" in code or "workspace" in code:
-            hints.append("Check the path exists first: workspace.exists(path) — workspace.read() and open() both accept absolute, relative, and ~ paths")
+        if "open" in code or "Path" in code:
+            hints.append("Check the path exists first (os.path.exists) — open() accepts absolute, relative, and ~-expanded paths")
 
     # ImportError: suggest installing into the server venv
     elif exc_type in ["ImportError", "ModuleNotFoundError"]:
@@ -296,30 +292,16 @@ class REPLEngine:
         self,
         mcp_wrapper: Optional[Any] = None,
         workspace_root: Optional[Path] = None,
-        enable_workspace: bool = True,
-        enable_git: bool = True,
-        enable_ast: bool = True,
-        enable_code: bool = True,
-        max_history: int = 100,
     ):
         """
-        Initialize REPL engine with persistent namespace and utilities.
+        Initialize REPL engine with persistent namespace.
 
         Args:
-            mcp_wrapper: MCP client wrapper to inject into namespace
-            workspace_root: Root directory for workspace operations (default: cwd)
-            enable_workspace: Enable workspace file utilities
-            enable_git: Enable git utilities (if in a git repo)
-            enable_ast: Enable AST analysis utilities (Python only)
-            enable_code: Enable multi-language code analysis utilities (tree-sitter)
-            max_history: Maximum number of history entries to keep (default: 100)
+            mcp_wrapper: MCP client wrapper (or proxy) injected as `mcp`
+            workspace_root: Default cwd for the sh() helper (default: cwd)
         """
         self.globals: dict[str, Any] = {"__builtins__": __builtins__}
         self.workspace_root = workspace_root or Path.cwd()
-
-        # History tracking
-        self._history: list[str] = []
-        self._max_history = max_history
 
         # Large-namespace warning fires once per session (reset clears it)
         self._namespace_warning_emitted = False
@@ -328,16 +310,6 @@ class REPLEngine:
         if mcp_wrapper:
             self.globals["mcp"] = mcp_wrapper
 
-        # Initialize workspace utilities
-        self._workspace = None
-        if enable_workspace:
-            try:
-                from .utilities.workspace import Workspace
-                self._workspace = Workspace(self.workspace_root)
-                self.globals["workspace"] = self._workspace
-            except Exception:
-                pass  # Workspace init failed, skip
-
         # Inject shell helper bound to workspace root
         try:
             from .utilities.shell import make_sh
@@ -345,47 +317,10 @@ class REPLEngine:
         except Exception:
             pass  # Shell helper init failed, skip
 
-        # Initialize git utilities (Phase 2 - will be implemented later)
-        self._git = None
-        if enable_git:
-            try:
-                from .utilities.git_utils import GitUtils
-                self._git = GitUtils(self.workspace_root)
-                self.globals["git"] = self._git
-            except ImportError:
-                pass  # GitUtils not yet implemented
-            except Exception:
-                pass  # Not a git repo or other error
-
-        # Initialize AST utilities (Python-specific, uses built-in ast module)
-        self._ast_utils = None
-        if enable_ast and self._workspace:
-            try:
-                from .utilities.ast_utils import ASTUtils
-                self._ast_utils = ASTUtils(self._workspace)
-                self.globals["ast_utils"] = self._ast_utils
-            except ImportError:
-                pass  # ASTUtils not available
-            except Exception:
-                pass  # AST init failed
-
-        # Initialize multi-language code utilities (uses tree-sitter)
-        self._code_utils = None
-        if enable_code and self._workspace:
-            try:
-                from .utilities.code_utils import CodeUtils
-                self._code_utils = CodeUtils(self._workspace)
-                self.globals["code"] = self._code_utils
-            except ImportError:
-                pass  # tree-sitter not available
-            except Exception:
-                pass  # CodeUtils init failed
-
     def execute(
         self,
         code: str,
         timeout: float = 120.0,
-        inject: Optional[dict] = None,
     ) -> ExecutionResult:
         """
         Execute Python code in persistent namespace with output capture.
@@ -396,40 +331,15 @@ class REPLEngine:
                     Enforced via cancellation for cells containing top-level
                     await; sync-code enforcement is the caller's job (the
                     kernel supervisor interrupts via SIGINT).
-            inject: Optional dict of variables to inject into namespace before execution.
-                   These variables persist in the namespace after execution.
-
         Returns:
             ExecutionResult with captured output and execution status
         """
-        # Detect magic commands (start with %)
-        code_stripped = code.strip()
-        if code_stripped.startswith('%'):
-            return self._execute_magic(code_stripped, timeout)
-
-        # Detect IPython-style help queries (object? or object??)
-        if code_stripped.endswith('??'):
-            return self._execute_help_query(code_stripped[:-2].strip(), show_source=True)
-        elif code_stripped.endswith('?') and not code_stripped.endswith('??'):
-            return self._execute_help_query(code_stripped[:-1].strip(), show_source=False)
-
-        # Track history (excluding magics and help queries which are handled above)
-        self._add_to_history(code_stripped)
-
         start_time = time.perf_counter()
         stdout_capture = StringIO()
         stderr_capture = StringIO()
         return_value = None
         exception_info = None
         success = True
-
-        # Inject variables into namespace
-        if inject:
-            for key, value in inject.items():
-                if key in RESERVED_NAMES:
-                    # Don't allow overwriting reserved names
-                    continue
-                self.globals[key] = value
 
         try:
             stmt_code, expr_code, is_async = self._compile_cell(code)
@@ -722,407 +632,3 @@ class REPLEngine:
     def get_namespace_vars(self) -> dict[str, str]:
         """Get current namespace variables (excluding reserved names)."""
         return self._get_namespace_vars_dict()
-
-    def _add_to_history(self, code: str) -> None:
-        """Add code to execution history."""
-        # Don't add empty or whitespace-only entries
-        if not code.strip():
-            return
-
-        # Don't add duplicates of the last entry
-        if self._history and self._history[-1] == code:
-            return
-
-        self._history.append(code)
-
-        # Trim if over max
-        if len(self._history) > self._max_history:
-            self._history = self._history[-self._max_history:]
-
-    def get_history(self, n: Optional[int] = None) -> list[str]:
-        """
-        Get execution history.
-
-        Args:
-            n: Number of recent entries to return (default: all)
-
-        Returns:
-            List of executed code strings
-        """
-        if n is None:
-            return list(self._history)
-        return list(self._history[-n:])
-
-    # =========================================================================
-    # IPython-style Help Queries (object? and object??)
-    # =========================================================================
-
-    def _execute_help_query(self, obj_name: str, show_source: bool = False) -> ExecutionResult:
-        """
-        Execute IPython-style help query (object? or object??).
-
-        Args:
-            obj_name: Name of object to get help for (e.g., "workspace", "workspace.read")
-            show_source: If True (??), show source code if available
-
-        Returns:
-            ExecutionResult with help text
-        """
-        import inspect
-        start_time = time.perf_counter()
-
-        if not obj_name:
-            # Just "?" with no object - show general help
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=True,
-                stdout=self._magic_help(),
-                execution_time_ms=execution_time_ms,
-            )
-
-        try:
-            # Resolve the object name (handles dotted names like workspace.read)
-            obj = self._resolve_name(obj_name)
-
-            from io import StringIO
-            out = StringIO()
-
-            # Get type info
-            obj_type = type(obj).__name__
-            out.write(f"Type: {obj_type}\n")
-
-            # Get signature for callables
-            if callable(obj):
-                try:
-                    sig = inspect.signature(obj)
-                    out.write(f"Signature: {obj_name}{sig}\n")
-                except (ValueError, TypeError):
-                    pass
-
-            # Get docstring
-            docstring = inspect.getdoc(obj)
-            if docstring:
-                out.write(f"\nDocstring:\n{docstring}\n")
-            else:
-                out.write("\nNo docstring available.\n")
-
-            # Show source if requested (??)
-            if show_source:
-                try:
-                    source = inspect.getsource(obj)
-                    out.write(f"\nSource:\n{source}\n")
-                except (TypeError, OSError):
-                    out.write("\nSource code not available.\n")
-
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=True,
-                stdout=out.getvalue(),
-                execution_time_ms=execution_time_ms,
-            )
-
-        except NameError as e:
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=False,
-                stderr=f"Object not found: {obj_name}",
-                exception=ExceptionInfo(
-                    type="NameError",
-                    message=str(e),
-                    traceback="",
-                ),
-                execution_time_ms=execution_time_ms,
-            )
-        except Exception as e:
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=False,
-                exception=ExceptionInfo(
-                    type=type(e).__name__,
-                    message=str(e),
-                    traceback="".join(traceback.format_exception_only(type(e), e)),
-                ),
-                execution_time_ms=execution_time_ms,
-            )
-
-    def _resolve_name(self, name: str) -> Any:
-        """
-        Resolve a dotted name to an object in the namespace.
-
-        Args:
-            name: Dotted name like "workspace" or "workspace.read"
-
-        Returns:
-            The resolved object
-
-        Raises:
-            NameError: If name cannot be resolved
-        """
-        parts = name.split('.')
-        obj = self.globals.get(parts[0])
-
-        if obj is None:
-            raise NameError(f"name '{parts[0]}' is not defined")
-
-        for part in parts[1:]:
-            try:
-                obj = getattr(obj, part)
-            except AttributeError:
-                raise NameError(f"'{'.'.join(parts[:parts.index(part)])}' has no attribute '{part}'")
-
-        return obj
-
-    # =========================================================================
-    # Magic Commands (IPython-style)
-    # =========================================================================
-
-    def _execute_magic(self, magic_line: str, timeout: float) -> ExecutionResult:
-        """
-        Execute IPython-style magic command.
-
-        Supported magics:
-            %who          List variable names
-            %whos         Detailed variable listing
-            %reset        Reset namespace (keep utilities)
-            %env          Show environment info
-            %timeit <code>  Time code execution
-            %mcp          Show MCP server info
-            %help         Show REPL help
-        """
-        start_time = time.perf_counter()
-
-        # Parse magic command
-        parts = magic_line[1:].split(maxsplit=1)
-        magic_name = parts[0].lower()
-        magic_args = parts[1] if len(parts) > 1 else ""
-
-        # Dispatch to magic handlers
-        try:
-            if magic_name == "who":
-                result = self._magic_who()
-            elif magic_name == "whos":
-                result = self._magic_whos()
-            elif magic_name == "reset":
-                result = self._magic_reset()
-            elif magic_name == "env":
-                result = self._magic_env()
-            elif magic_name == "timeit":
-                result = self._magic_timeit(magic_args, timeout)
-            elif magic_name == "mcp":
-                result = self._magic_mcp()
-            elif magic_name == "history":
-                result = self._magic_history(magic_args)
-            elif magic_name == "help":
-                result = self._magic_help()
-            else:
-                execution_time_ms = (time.perf_counter() - start_time) * 1000
-                return ExecutionResult(
-                    success=False,
-                    stderr=f"Unknown magic command: %{magic_name}\nUse %help to see available magics",
-                    execution_time_ms=execution_time_ms,
-                )
-
-            # Add execution time to result
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=True,
-                stdout=result,
-                execution_time_ms=execution_time_ms,
-            )
-
-        except Exception as e:
-            execution_time_ms = (time.perf_counter() - start_time) * 1000
-            return ExecutionResult(
-                success=False,
-                exception=ExceptionInfo(
-                    type=type(e).__name__,
-                    message=str(e),
-                    traceback="".join(traceback.format_exception_only(type(e), e)),
-                ),
-                execution_time_ms=execution_time_ms,
-            )
-
-    def _magic_who(self) -> str:
-        """List variable names (like IPython %who)."""
-        var_names = [k for k in self.globals.keys() if k not in RESERVED_NAMES]
-        if var_names:
-            return "  ".join(sorted(var_names))
-        return "(no variables)"
-
-    def _magic_whos(self) -> str:
-        """Detailed variable listing (like IPython %whos)."""
-        from io import StringIO
-        out = StringIO()
-        out.write("Variable      Type           Value\n")
-        out.write("-" * 60 + "\n")
-
-        for name in sorted(self.globals.keys()):
-            if name in RESERVED_NAMES:
-                continue
-            value = self.globals[name]
-            type_name = type(value).__name__
-            try:
-                value_repr = repr(value)[:40]
-            except Exception:
-                value_repr = "<unprintable>"
-            out.write(f"{name:12}  {type_name:12}  {value_repr}\n")
-
-        result = out.getvalue()
-        if result.count("\n") == 2:  # Only header, no variables
-            return "(no variables)"
-        return result
-
-    def _magic_reset(self) -> str:
-        """Reset namespace, preserving utilities."""
-        self.reset_namespace()
-        return "Namespace reset (utilities preserved)"
-
-    def _magic_env(self) -> str:
-        """Show environment information."""
-        from io import StringIO
-        out = StringIO()
-
-        out.write(f"Workspace: {self.workspace_root}\n")
-
-        if self._git:
-            try:
-                status = self._git.status()
-                out.write(f"Git repo: {status.branch}\n")
-            except Exception:
-                out.write("Git repo: (not a git repo)\n")
-
-        out.write(f"\nUtilities loaded:\n")
-        for util in ['workspace', 'git', 'ast_utils', 'code', 'mcp']:
-            if util in self.globals:
-                if util == 'mcp':
-                    mcp = self.globals['mcp']
-                    if hasattr(mcp, 'servers'):
-                        server_count = len(mcp.servers)
-                        out.write(f"  - mcp ({server_count} servers connected)\n")
-                    else:
-                        out.write(f"  - mcp\n")
-                else:
-                    out.write(f"  - {util}\n")
-
-        return out.getvalue()
-
-    def _magic_timeit(self, code: str, timeout: float) -> str:
-        """Time code execution (simplified version of IPython %timeit)."""
-        if not code.strip():
-            return "Usage: %timeit <code>\nExample: %timeit sum(range(1000))"
-
-        # Run 3 times, take best
-        times = []
-        for _ in range(3):
-            start = time.perf_counter()
-            exec(code, self.globals, self.globals)
-            end = time.perf_counter()
-            times.append((end - start) * 1000)  # Convert to ms
-
-        best_time = min(times)
-        if best_time < 1:
-            return f"3 loops, best of 3: {best_time * 1000:.1f} µs per loop"
-        elif best_time < 1000:
-            return f"3 loops, best of 3: {best_time:.3f} ms per loop"
-        else:
-            return f"3 loops, best of 3: {best_time / 1000:.2f} s per loop"
-
-    def _magic_mcp(self) -> str:
-        """Show MCP server and tool information."""
-        mcp = self.globals.get('mcp')
-        if not mcp or not hasattr(mcp, 'servers'):
-            return "No MCP servers connected\n\nConfigure servers in .mcp.json for auto-connect"
-
-        servers = mcp.servers
-        if not servers:
-            return "No MCP servers connected\n\nConfigure servers in .mcp.json for auto-connect"
-
-        from io import StringIO
-        out = StringIO()
-        out.write("Connected MCP servers:\n")
-
-        tool_list = mcp.list_tools()
-        for server in servers:
-            tools = tool_list.get(server, [])
-            out.write(f"\n  {server} ({len(tools)} tools)\n")
-            for tool in tools[:5]:  # Show first 5 tools
-                out.write(f"    - {tool}\n")
-            if len(tools) > 5:
-                out.write(f"    ... and {len(tools) - 5} more\n")
-
-        out.write(f"\nUse mcp.help('server') to see all tools for a server")
-
-        return out.getvalue()
-
-    def _magic_history(self, args: str) -> str:
-        """Show execution history (like IPython %history)."""
-        # Parse optional count argument
-        n = None
-        if args.strip():
-            try:
-                n = int(args.strip())
-            except ValueError:
-                return f"Usage: %history [n]\nExample: %history 10"
-
-        history = self.get_history(n)
-
-        if not history:
-            return "(no history)"
-
-        from io import StringIO
-        out = StringIO()
-
-        # Show numbered history entries
-        start_num = len(self._history) - len(history) + 1
-        for i, code in enumerate(history, start=start_num):
-            # Handle multi-line code
-            lines = code.split('\n')
-            if len(lines) == 1:
-                out.write(f"{i:4}: {code}\n")
-            else:
-                out.write(f"{i:4}: {lines[0]}\n")
-                for line in lines[1:]:
-                    out.write(f"      {line}\n")
-
-        return out.getvalue()
-
-    def _magic_help(self) -> str:
-        """Show REPL help."""
-        return """
-Python REPL with integrated utilities
-
-Utilities:
-  sh         - Shell commands: data = json.loads(sh("gh pr list --json number"))
-               Returns stdout str with .returncode/.stderr/.ok; check=False to not raise
-  workspace  - File access: workspace.read(path), workspace.glob("**/*.py")
-               Absolute and ~ paths supported
-  git        - Git ops: git.log(), git.diff(), git.blame(path)
-  ast_utils  - Python AST: ast_utils.find_functions(path)
-  code       - Multi-lang: code.find_functions(path) (100+ languages)
-  mcp        - MCP tools: mcp.tools.<server>.<method>()
-
-Magic commands:
-  %who          List variable names
-  %whos         Detailed variable listing (type, value)
-  %history [n]  Show execution history
-  %reset        Reset namespace (keep utilities)
-  %env          Show environment info
-  %timeit code  Time code execution
-  %mcp          Show MCP servers and tools
-  %help         Show this help
-
-Quick help (IPython-style):
-  object?       Show docstring (e.g., workspace?, git.log?)
-  object??      Show source code if available
-
-Standard Python:
-  help(obj)     Full documentation
-  dir(obj)      List attributes
-  type(obj)     Show type
-
-Tips:
-  - open(), absolute paths, and ~ all work (full filesystem access)
-  - sh() composes shell + Python in one call (replaces `cmd | python3 -c`)
-  - Variables persist between calls (use %reset to clear)
-  - Use %history to recall previous code
-"""

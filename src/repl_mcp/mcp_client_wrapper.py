@@ -74,108 +74,8 @@ if sys.version_info < (3, 14):
 logger = logging.getLogger(__name__)
 
 
-class ToolNamespace:
-    """
-    Dynamic namespace for accessing tools on a specific server.
-
-    Provides attribute-style access to MCP tools:
-        mcp.tools.github.create_issue(owner="...", repo="...", title="...")
-
-    Supports introspection:
-        dir(mcp.tools.github)  # List available tools
-        mcp.tools.github       # Shows server info and tool count
-    """
-
-    def __init__(self, client_wrapper: "MCPClientWrapper", server_name: str):
-        self._client = client_wrapper
-        self._server = server_name
-        # Cache tool list for introspection (lazy-loaded)
-        self._tools_cache: list[str] | None = None
-
-    def _get_tools(self) -> list[str]:
-        """Get list of tools, with caching."""
-        if self._tools_cache is None:
-            try:
-                tools_dict = self._client.list_tools(self._server)
-                self._tools_cache = tools_dict.get(self._server, [])
-            except Exception:
-                self._tools_cache = []
-        return self._tools_cache
-
-    def __dir__(self) -> list[str]:
-        """Support dir(mcp.tools.server) to list available tools."""
-        return self._get_tools()
-
-    def __repr__(self) -> str:
-        """Helpful repr showing server name and tool count."""
-        tools = self._get_tools()
-        if tools:
-            return f"<ToolNamespace '{self._server}' with {len(tools)} tools: {', '.join(tools[:3])}{'...' if len(tools) > 3 else ''}>"
-        return f"<ToolNamespace '{self._server}' (not connected or no tools)>"
-
-    def __getattr__(self, tool_name: str):
-        """Return callable for the specified tool."""
-        # Skip private attributes to avoid recursion
-        if tool_name.startswith('_'):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{tool_name}'")
-
-        # Get tool description for docstring
-        tool_doc = self._get_tool_description(tool_name)
-
-        def tool_caller(**kwargs):
-            # Extract timeout if provided, otherwise use default
-            timeout = kwargs.pop('_timeout', 60.0)
-            return self._client._invoke_tool(self._server, tool_name, timeout=timeout, **kwargs)
-
-        # Attach metadata to the callable
-        tool_caller.__name__ = tool_name
-        tool_caller.__qualname__ = f"mcp.tools.{self._server}.{tool_name}"
-        tool_caller.__doc__ = tool_doc
-        return tool_caller
-
-    def _get_tool_description(self, tool_name: str) -> str:
-        """Get description for a specific tool."""
-        try:
-            help_text = self._client.help(self._server, tool_name)
-            return help_text
-        except Exception:
-            return f"MCP tool: {self._server}.{tool_name}\n\nUse mcp.help('{self._server}', '{tool_name}') for details."
-
-
-class ToolsContainer:
-    """
-    Container providing attribute-style access to MCP server namespaces.
-
-    Supports introspection:
-        dir(mcp.tools)     # List connected servers
-        mcp.tools          # Shows connected server info
-        mcp.tools.github   # Access tools on 'github' server
-    """
-
-    def __init__(self, client_wrapper: "MCPClientWrapper"):
-        self._client = client_wrapper
-
-    def __dir__(self) -> list[str]:
-        """Support dir(mcp.tools) to list connected servers."""
-        return self._client.servers
-
-    def __repr__(self) -> str:
-        """Helpful repr showing connected servers."""
-        servers = self._client.servers
-        if servers:
-            return f"<ToolsContainer with {len(servers)} servers: {', '.join(servers)}>"
-        return "<ToolsContainer (no servers connected)>"
-
-    def __getattr__(self, server_name: str) -> ToolNamespace:
-        """Return namespace for the specified server."""
-        # Skip private attributes
-        if server_name.startswith('_'):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{server_name}'")
-        return ToolNamespace(self._client, server_name)
-
-
 class MCPClientWrapper:
-    """Synchronous wrapper for MCP client with dynamic tool access and Python-native introspection."""
+    """Synchronous wrapper around MCP client sessions (call/list_tools/help)."""
 
     def __init__(self):
         self._sessions: dict[str, ClientSession] = {}
@@ -191,7 +91,6 @@ class MCPClientWrapper:
         self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
         # Connection failures by server name (reason string), for help()/servers
         self.failed: dict[str, str] = {}
-        self.tools = ToolsContainer(self)
 
     @property
     def servers(self) -> list[str]:
@@ -209,11 +108,11 @@ class MCPClientWrapper:
 
     def __dir__(self):
         """Support dir(mcp) introspection."""
-        return ['tools', 'servers', 'failed', 'call', 'list_tools', 'help', 'discover_tools']
+        return ['servers', 'failed', 'call', 'list_tools', 'help']
 
     def call(self, server: str, tool: str, *, timeout: float = 60.0, **kwargs) -> Any:
         """
-        Call a tool on a connected server (alias for mcp.tools.<server>.<tool>(...)).
+        Call a tool on a connected server.
 
         Args:
             server: Server name (see mcp.servers)
@@ -495,17 +394,6 @@ class MCPClientWrapper:
 
         return self._run_async(get_tools())
 
-    def discover_tools(self) -> dict[str, list[str]]:
-        """
-        List all available tools from connected servers.
-
-        Deprecated: Use list_tools() instead for Python-native introspection.
-
-        Returns:
-            Dict mapping server names to lists of tool names
-        """
-        return self.list_tools()
-
     def help(self, server: Optional[str] = None, tool: Optional[str] = None) -> str:
         """
         Show help for MCP servers and tools.
@@ -544,7 +432,7 @@ class MCPClientWrapper:
                 for srv, reason in self.failed.items():
                     output += f"  {srv}: {reason}\n"
             output += "\nUse mcp.help('server') to see tools for a specific server"
-            output += "\nCall tools via mcp.call('server', 'tool', **args) or mcp.tools.<server>.<tool>(**args)"
+            output += "\nCall tools via mcp.call('server', 'tool', **args)"
             output += f"\n\n{scope_note}"
             return output
 
@@ -563,7 +451,6 @@ class MCPClientWrapper:
             for t in tools:
                 output += f"  - {t}\n"
             output += f"\nUse mcp.help('{server}', 'tool_name') for details on a specific tool"
-            output += f"\nOr: help(mcp.tools.{server}.tool_name)"
             return output
 
         else:

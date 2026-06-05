@@ -21,19 +21,10 @@ mcp_wrapper: Optional[MCPClientWrapper] = None
 repl_engine: Optional[REPLEngine] = None
 
 
-def setup_logging(transport: str, debug: bool = False) -> logging.Logger:
+def setup_logging(debug: bool = False) -> logging.Logger:
     """
-    Configure logging to avoid stdout pollution.
-
-    Args:
-        transport: Transport type ('stdio' or 'sse')
-        debug: Enable debug logging (still logs to stderr)
-
-    Returns:
-        Logger instance
+    Configure logging to stderr (stdout carries stdio JSON-RPC).
     """
-    # Stdout must be kept clean for the stdio transport (it carries JSON-RPC).
-    # Logging to stderr is also safe for SSE mode.
     handler = logging.StreamHandler(sys.stderr)
 
     handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
@@ -194,7 +185,6 @@ def create_server(
         code: str,
         reset: bool = False,
         timeout: float = 120.0,
-        inject: Optional[dict] = None
     ):
         """
         Persistent Python REPL — use this instead of `python3 -c`, heredocs,
@@ -202,33 +192,26 @@ def create_server(
 
         State (variables, imports, functions) survives across calls: a warm
         call takes ~0.1s vs ~3s for each fresh `python3` Bash spawn. Full
-        filesystem access — open(), absolute paths, and ~ all work.
+        filesystem access — open(), absolute paths, and ~ all work. Top-level
+        `await` is supported (e.g. `await client.get(url)` with httpx).
 
-        Pre-injected utilities:
-          sh         - Shell commands: json.loads(sh("gh pr view 1 --json title"))
-                       Returns stdout str with .returncode/.stderr/.ok
-          workspace  - File ops: .read(), .write(), .glob() (absolute paths OK)
-          git        - Git ops: .log(), .diff(), .blame(), .status()
-          ast_utils  - Python AST: .find_functions(), .find_classes(), .find_calls()
-          code       - Multi-lang (100+ languages): .find_functions(), .find_classes()
-          mcp        - MCP tools: .call(server, tool, **args), .servers, .help()
-                       Scope: only servers from this project's .mcp.json —
-                       host-level connectors (claude.ai Notion/GitHub, user-scope
-                       servers) are NOT reachable here; call their tools directly.
+        Helpers:
+          sh   - Shell commands: json.loads(sh("gh pr view 1 --json title"))
+                 Returns stdout str with .returncode/.stderr/.ok
+          mcp  - Bridge to this project's .mcp.json MCP servers:
+                 .call(server, tool, **args), .servers, .failed, .help()
+                 Connects lazily on first use. Host-level connectors
+                 (claude.ai Notion/GitHub, user-scope servers) are NOT
+                 reachable here — call their tools directly.
 
         Missing package? Install into the running REPL env: sh('uv pip install <pkg>')
 
-        Quick reference:
-          %help       - Full documentation and examples
-          object?     - Show docstring (e.g., sh?, workspace?, git.log?)
-          %who        - List variables
-          %history    - Show execution history
-
         Args:
             code: Python code to execute
-            reset: Clear namespace (keeps utilities)
-            timeout: Max execution seconds (default 120)
-            inject: Variables to inject (e.g., {"data": [1,2,3]})
+            reset: Clear namespace (keeps sh/mcp helpers)
+            timeout: Max execution seconds (default 120). Enforced for real:
+                     runaway code is interrupted (KeyboardInterrupt) with
+                     namespace state preserved.
 
         Returns:
             Plain text output (stdout, return value, or error message)
@@ -237,90 +220,21 @@ def create_server(
             repl_engine.reset_namespace()
 
         result = await anyio.to_thread.run_sync(
-            lambda: repl_engine.execute(code, timeout=timeout, inject=inject)
+            lambda: repl_engine.execute(code, timeout=timeout)
         )
         return str(result)
 
     return mcp_server
 
 
-def initialize_server(autoconnect: bool = True, config_path: Path = Path(".mcp.json")):
-    """
-    Initialize global server state.
-
-    NOTE: This function is primarily for testing. In production, initialization
-    happens automatically via the server's lifespan hook.
-
-    Args:
-        autoconnect: Whether to auto-connect to servers from .mcp.json
-        config_path: Path to .mcp.json configuration file
-    """
-    global mcp_wrapper, repl_engine
-
-    # Initialize MCP wrapper
-    mcp_wrapper = MCPClientWrapper()
-
-    # Initialize REPL engine with mcp wrapper and workspace root
-    repl_engine = REPLEngine(
-        mcp_wrapper=mcp_wrapper,
-        workspace_root=Path.cwd(),
-    )
-
-    # Auto-connect to configured servers
-    if autoconnect:
-        servers = load_mcp_config(config_path)
-
-        # Filter out self
-        servers = filter_servers(servers, exclude=["python-repl"])
-
-        if servers:
-            logger = logging.getLogger(__name__)
-            logger.info(f"Auto-connecting to {len(servers)} MCP servers from {config_path}...")
-            results = mcp_wrapper.connect(servers)
-            for name, success in results.items():
-                status = "✓" if success else "✗"
-                logger.info(f"  {status} {name}")
-
-
-def check_port_available(port: int) -> bool:
-    """
-    Check if port is available before starting server.
-
-    Args:
-        port: Port number to check
-
-    Returns:
-        True if port is available, False otherwise
-    """
-    import socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(('0.0.0.0', port))
-        sock.close()
-        return True
-    except OSError:
-        return False
-
-
 def main():
     """Main entry point for CLI."""
-    parser = argparse.ArgumentParser(description="Stateful Python REPL MCP Server")
+    parser = argparse.ArgumentParser(description="Stateful Python REPL MCP Server (stdio)")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio"],
         default="stdio",
-        help="Transport type (default: stdio)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port for SSE transport (default: 8000)",
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host for SSE transport (default: 0.0.0.0)",
+        help="Transport type (stdio only)",
     )
     parser.add_argument(
         "--config",
@@ -342,14 +256,7 @@ def main():
     args = parser.parse_args()
 
     # Setup logging before server starts
-    logger = setup_logging(args.transport, args.debug)
-
-    # Check port availability for SSE mode
-    if args.transport == "sse":
-        if not check_port_available(args.port):
-            logger.error(f"Port {args.port} is already in use")
-            logger.error("Try: uv run repl-mcp --transport sse --port <different-port>")
-            sys.exit(1)
+    logger = setup_logging(args.debug)
 
     # Create server with lifespan (initialization happens automatically)
     mcp_server = create_server(
@@ -359,10 +266,7 @@ def main():
     )
 
     # Run server
-    if args.transport == "stdio":
-        mcp_server.run(transport="stdio")
-    else:
-        mcp_server.run(transport="sse", host=args.host, port=args.port)
+    mcp_server.run(transport="stdio")
 
 
 if __name__ == "__main__":

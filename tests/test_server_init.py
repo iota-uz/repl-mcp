@@ -4,6 +4,13 @@ import inspect
 from pathlib import Path
 from repl_mcp import repl_mcp_server
 
+def _init_globals():
+    """Initialize module globals the way the server lifespan does."""
+    from repl_mcp.mcp_client_wrapper import MCPClientWrapper
+    from repl_mcp.repl_engine import REPLEngine
+    repl_mcp_server.mcp_wrapper = MCPClientWrapper()
+    repl_mcp_server.repl_engine = REPLEngine(mcp_wrapper=repl_mcp_server.mcp_wrapper)
+
 
 def test_load_mcp_config_missing_file():
     """Test loading config when file doesn't exist."""
@@ -26,7 +33,7 @@ def test_load_mcp_config_valid():
 def test_initialize_server_no_autoconnect():
     """Test server initializes without auto-connecting."""
     # This should not fail even if .mcp.json has invalid configs
-    repl_mcp_server.initialize_server(autoconnect=False)
+    _init_globals()
 
     assert repl_mcp_server.mcp_wrapper is not None
     assert repl_mcp_server.repl_engine is not None
@@ -42,7 +49,6 @@ def test_tools_registered():
     assert hasattr(server, 'create_server')
     assert hasattr(server, 'mcp_wrapper')
     assert hasattr(server, 'repl_engine')
-    assert hasattr(server, 'initialize_server')
     assert hasattr(server, 'load_mcp_config')
     assert hasattr(server, 'filter_servers')
     assert hasattr(server, 'create_server_lifespan')
@@ -51,7 +57,7 @@ def test_tools_registered():
 def test_execute_python_via_engine():
     """Test execute_python functionality via engine."""
     # Initialize server
-    repl_mcp_server.initialize_server(autoconnect=False)
+    _init_globals()
 
     # Access the engine directly
     engine = repl_mcp_server.repl_engine
@@ -65,7 +71,7 @@ def test_execute_python_via_engine():
 
 def test_list_namespace_vars_via_engine():
     """Test list_namespace_vars via engine."""
-    repl_mcp_server.initialize_server(autoconnect=False)
+    _init_globals()
 
     engine = repl_mcp_server.repl_engine
 

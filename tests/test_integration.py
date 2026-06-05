@@ -3,20 +3,27 @@
 import pytest
 from repl_mcp import repl_mcp_server
 
+def _init_globals():
+    """Initialize module globals the way the server lifespan does."""
+    from repl_mcp.mcp_client_wrapper import MCPClientWrapper
+    from repl_mcp.repl_engine import REPLEngine
+    repl_mcp_server.mcp_wrapper = MCPClientWrapper()
+    repl_mcp_server.repl_engine = REPLEngine(mcp_wrapper=repl_mcp_server.mcp_wrapper)
+
 
 class TestServerIntegration:
     """End-to-end integration tests."""
 
     def test_server_initialization(self):
         """Test server initializes correctly."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
 
         assert repl_mcp_server.mcp_wrapper is not None
         assert repl_mcp_server.repl_engine is not None
 
     def test_execute_python_basic(self):
         """Test basic code execution."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
 
         result = repl_mcp_server.repl_engine.execute("x = 42")
         assert result.success
@@ -24,7 +31,7 @@ class TestServerIntegration:
 
     def test_execute_python_with_state(self):
         """Test state persistence across executions."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         result1 = engine.execute("x = 42")
@@ -36,7 +43,7 @@ class TestServerIntegration:
 
     def test_execute_python_with_output(self):
         """Test output capture."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         result = engine.execute('print("Hello from REPL!")')
@@ -45,7 +52,7 @@ class TestServerIntegration:
 
     def test_execute_python_with_return(self):
         """Test return value capture."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         engine.execute("x = 42")
@@ -57,7 +64,7 @@ class TestServerIntegration:
 
     def test_error_handling(self):
         """Test error handling and recovery."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         # Set a variable
@@ -76,7 +83,7 @@ class TestServerIntegration:
 
     def test_imports_and_functions(self):
         """Test imports and function definitions."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         # Test import
@@ -102,7 +109,7 @@ def greet(name):
 
     def test_namespace_operations(self):
         """Test namespace operations."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         # Set some variables
@@ -123,19 +130,17 @@ def greet(name):
 
     def test_mcp_client_wrapper(self):
         """Test MCP client wrapper structure."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         wrapper = repl_mcp_server.mcp_wrapper
 
-        # Test discover_tools (should be empty since no servers connected)
-        tools = wrapper.discover_tools()
-        assert isinstance(tools, dict)
-
-        # Test tools namespace exists
-        assert hasattr(wrapper, "tools")
+        # No servers connected: empty listing, clean help
+        assert wrapper.list_tools() == {}
+        assert wrapper.servers == []
+        assert "No MCP servers" in wrapper.help()
 
     def test_multiline_code(self):
         """Test multiline code execution."""
-        repl_mcp_server.initialize_server(autoconnect=False)
+        _init_globals()
         engine = repl_mcp_server.repl_engine
 
         code = """
