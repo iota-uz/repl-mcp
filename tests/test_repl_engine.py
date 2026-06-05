@@ -581,3 +581,63 @@ def my_function(x, y):
         assert result.success
         assert "Add two numbers" in result.stdout
         assert "Signature:" in result.stdout
+
+
+class TestTopLevelAwait:
+    """Tests for PyCF_ALLOW_TOP_LEVEL_AWAIT cell support."""
+
+    def test_top_level_await_statement(self):
+        """`await` works at top level and assignments persist."""
+        engine = REPLEngine()
+        result = engine.execute(
+            "import asyncio\n"
+            "x = 1\n"
+            "await asyncio.sleep(0)\n"
+            "y = x + 1\n"
+        )
+        assert result.success, result.exception
+        assert result.namespace_vars.get("y") == "2"
+
+    def test_trailing_await_expression_returns_value(self):
+        """A trailing `await expr` produces the awaited value as return_value."""
+        engine = REPLEngine()
+        result = engine.execute(
+            "import asyncio\n"
+            "async def f():\n"
+            "    return 41 + 1\n"
+            "await f()\n"
+        )
+        assert result.success, result.exception
+        assert result.return_value == "42"
+
+    def test_async_cell_timeout_is_real_and_state_survives(self):
+        """Async cells are cancelled at timeout; prior state is preserved."""
+        engine = REPLEngine()
+        engine.execute("marker = 'before'")
+        result = engine.execute(
+            "import asyncio\nawait asyncio.sleep(60)\n", timeout=0.2
+        )
+        assert not result.success
+        assert result.exception.type == "TimeoutError"
+        # State from before the timeout survives
+        again = engine.execute("marker")
+        assert again.return_value == "'before'"
+
+    def test_sync_cells_unchanged(self):
+        """Plain cells still use the sync path (no event loop involved)."""
+        engine = REPLEngine()
+        result = engine.execute("a = [i for i in range(3)]\na")
+        assert result.success
+        assert result.return_value == "[0, 1, 2]"
+
+    def test_returned_coroutine_still_awaited(self):
+        """Legacy path: trailing expr returning a coroutine is awaited."""
+        engine = REPLEngine()
+        result = engine.execute(
+            "import asyncio\n"
+            "async def g():\n"
+            "    return 'ran'\n"
+            "g()\n"
+        )
+        assert result.success, result.exception
+        assert result.return_value == "'ran'"

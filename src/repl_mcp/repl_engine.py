@@ -4,6 +4,7 @@ import sys
 import ast
 import time
 import asyncio
+import inspect
 import traceback
 from io import StringIO
 from pathlib import Path
@@ -391,10 +392,10 @@ class REPLEngine:
 
         Args:
             code: Python code to execute
-            timeout: Maximum execution time in seconds (default: 120s)
-                    Note: This timeout is enforced for MCP tool calls via the mcp object.
-                    Direct Python code execution cannot be easily interrupted due to
-                    Python's execution model.
+            timeout: Maximum execution time in seconds (default: 120s).
+                    Enforced via cancellation for cells containing top-level
+                    await; sync-code enforcement is the caller's job (the
+                    kernel supervisor interrupts via SIGINT).
             inject: Optional dict of variables to inject into namespace before execution.
                    These variables persist in the namespace after execution.
 
@@ -431,44 +432,57 @@ class REPLEngine:
                 self.globals[key] = value
 
         try:
-            # Compile code to check for syntax errors early
-            compiled_code = compile(code, "<repl>", "exec")
+            stmt_code, expr_code, is_async = self._compile_cell(code)
 
-            # Parse AST to detect trailing expression for return value
-            parsed = ast.parse(code, "<repl>", "exec")
-            if parsed.body and isinstance(parsed.body[-1], ast.Expr):
-                # Split into statements and final expression
-                statements = parsed.body[:-1]
-                final_expr = parsed.body[-1]
-
-                # Execute statements
-                if statements:
-                    stmt_module = ast.Module(body=statements, type_ignores=[])
-                    ast.fix_missing_locations(stmt_module)
-                    stmt_code = compile(stmt_module, "<repl>", "exec")
-
-                    with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+                if is_async:
+                    # Top-level await: run the cell as a coroutine on a fresh
+                    # event loop. wait_for makes timeout REAL (cancellable)
+                    # for async cells.
+                    return_value = asyncio.run(
+                        asyncio.wait_for(
+                            self._run_cell_async(stmt_code, expr_code),
+                            timeout=timeout,
+                        )
+                    )
+                else:
+                    if stmt_code is not None:
                         exec(stmt_code, self.globals, self.globals)
+                    if expr_code is not None:
+                        return_value = eval(expr_code, self.globals, self.globals)
 
-                # Evaluate final expression for return value
-                expr_code = compile(ast.Expression(body=final_expr.value), "<repl>", "eval")
-                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    return_value = eval(expr_code, self.globals, self.globals)
+                # Legacy convenience: a trailing expression that *returns* a
+                # coroutine (e.g. `main()` without await) is awaited for the
+                # caller on a fresh loop.
+                if asyncio.iscoroutine(return_value):
+                    return_value = asyncio.run(
+                        asyncio.wait_for(return_value, timeout=timeout)
+                    )
 
-                    # If result is awaitable (Task or coroutine), await it
-                    if asyncio.iscoroutine(return_value) or asyncio.isfuture(return_value):
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # We're in an async context, run the coroutine
-                            return_value = loop.run_until_complete(return_value)
-                        except RuntimeError:
-                            # No running loop, create one
-                            return_value = asyncio.run(return_value)
-            else:
-                # No trailing expression, just execute
-                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                    exec(compiled_code, self.globals, self.globals)
-
+        except asyncio.TimeoutError:
+            success = False
+            exception_info = ExceptionInfo(
+                type="TimeoutError",
+                message=(
+                    f"async execution cancelled after {timeout:.0f}s timeout. "
+                    "Namespace changes made before the timeout are preserved."
+                ),
+                traceback=f"TimeoutError: async cell exceeded {timeout:.0f}s\n",
+                hints=["Raise the timeout parameter for long-running async work"],
+                similar_names=[],
+            )
+        except KeyboardInterrupt:
+            success = False
+            exception_info = ExceptionInfo(
+                type="KeyboardInterrupt",
+                message=(
+                    "execution interrupted. Namespace state up to the "
+                    "interrupt is preserved."
+                ),
+                traceback="KeyboardInterrupt\n",
+                hints=[],
+                similar_names=[],
+            )
         except SyntaxError as e:
             success = False
 
@@ -561,6 +575,65 @@ class REPLEngine:
             namespace_vars_info=namespace_vars_info,
             warnings=warnings,
         )
+
+    def _compile_cell(self, code: str):
+        """
+        Compile a cell into (stmt_code, expr_code, is_async).
+
+        Splits a trailing expression off for return-value capture (REPL
+        semantics) and compiles both parts with PyCF_ALLOW_TOP_LEVEL_AWAIT
+        so `await` works at top level (IPython autoawait-style). Module-level
+        code objects lack CO_NEWLOCALS, so eval(co, globals, globals) keeps
+        assignments persistent in the namespace even on the async path.
+
+        Returns:
+            stmt_code: code object for leading statements (or None)
+            expr_code: eval-mode code object for the trailing expression (or None)
+            is_async: True if either part contains top-level await
+        """
+        flags = ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+
+        # Parse once; SyntaxError propagates to the caller's handler.
+        parsed = ast.parse(code, "<repl>", "exec")
+
+        stmt_code = None
+        expr_code = None
+
+        if parsed.body and isinstance(parsed.body[-1], ast.Expr):
+            statements = parsed.body[:-1]
+            final_expr = parsed.body[-1]
+
+            if statements:
+                stmt_module = ast.Module(body=statements, type_ignores=[])
+                ast.fix_missing_locations(stmt_module)
+                stmt_code = compile(stmt_module, "<repl>", "exec", flags=flags)
+
+            expr_code = compile(
+                ast.Expression(body=final_expr.value), "<repl>", "eval", flags=flags
+            )
+        else:
+            stmt_code = compile(parsed, "<repl>", "exec", flags=flags)
+
+        is_async = any(
+            co is not None and bool(co.co_flags & inspect.CO_COROUTINE)
+            for co in (stmt_code, expr_code)
+        )
+        return stmt_code, expr_code, is_async
+
+    async def _run_cell_async(self, stmt_code, expr_code) -> Any:
+        """Run a compiled cell containing top-level await; returns the
+        trailing-expression value (or None)."""
+        if stmt_code is not None:
+            result = eval(stmt_code, self.globals, self.globals)
+            if stmt_code.co_flags & inspect.CO_COROUTINE:
+                await result
+
+        return_value = None
+        if expr_code is not None:
+            return_value = eval(expr_code, self.globals, self.globals)
+            if expr_code.co_flags & inspect.CO_COROUTINE:
+                return_value = await return_value
+        return return_value
 
     def _extract_error_line(self, code: str, lineno: Optional[int]) -> Optional[str]:
         """Extract the specific line that caused an error."""
