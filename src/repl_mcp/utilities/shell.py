@@ -105,7 +105,12 @@ def sh(
         cmd,
         shell=True,
         capture_output=True,
-        text=True,
+        # errors="replace": command output is frequently not clean UTF-8 (git
+        # diffs touching binaries, file dumps). Strict decoding would raise
+        # UnicodeDecodeError before .returncode/.stderr are even reachable —
+        # and surrogateescape would smuggle lone surrogates into MCP responses.
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         cwd=str(cwd) if cwd else (str(_default_cwd) if _default_cwd else None),
         env=merged_env,

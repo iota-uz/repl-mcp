@@ -180,6 +180,18 @@ class KernelSupervisor:
         child doesn't return within the grace period, it is killed and
         respawned (state lost, reported via a kernel_restarted warning).
         """
+        if not (isinstance(timeout, (int, float)) and timeout > 0):
+            return ExecutionResult(
+                success=False,
+                exception=ExceptionInfo(
+                    type="ValueError",
+                    message=f"timeout must be a positive number of seconds (got {timeout!r})",
+                    traceback="",
+                    hints=["Call again with a positive timeout, e.g. timeout=120"],
+                ),
+                execution_time_ms=0.0,
+            )
+
         async with self._exec_lock:
             if not self._alive():
                 await self._respawn_after_crash()
@@ -232,7 +244,10 @@ class KernelSupervisor:
             frame = Frame.from_wire(wire)
             result = ExecutionResult(**frame.payload)
 
-            if interrupted:
+            # Only annotate results that actually show the interrupt — a cell
+            # that finished in the SIGINT race (or caught it and succeeded)
+            # must not carry a bogus "was interrupted" warning.
+            if interrupted and not result.success:
                 result.warnings.append(WarningInfo(
                     category="timeout_interrupt",
                     message=(

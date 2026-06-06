@@ -239,8 +239,11 @@ class TestTruncation:
         assert result.stdout_info is not None
         assert result.stdout_info.truncated is True
         assert result.stdout_info.original_size > 50000
-        assert len(result.stdout) <= 50000 + len("\n... [TRUNCATED]")
-        assert result.stdout.endswith("... [TRUNCATED]")
+        assert len(result.stdout) <= 50000
+        assert "TRUNCATED" in result.stdout
+        # Head+tail truncation: both ends of the output survive
+        assert result.stdout.startswith("x")
+        assert result.stdout.rstrip().endswith("x")
 
     def test_stdout_no_truncation_small_output(self):
         """Test that small stdout is not truncated."""
@@ -261,7 +264,7 @@ class TestTruncation:
         assert result.success
         assert result.return_value_info is not None
         if result.return_value_info.truncated:
-            assert len(result.return_value) <= 20000 + len("\n... [TRUNCATED]")
+            assert len(result.return_value) <= 20000
 
     def test_namespace_var_truncation(self):
         """Test that namespace vars are truncated with metadata."""
@@ -278,7 +281,7 @@ class TestTruncation:
         trunc_info = result.namespace_vars_info['my_list']
         if trunc_info.truncated:
             assert trunc_info.original_size > 500
-            assert len(result.namespace_vars['my_list']) <= 500 + len("\n... [TRUNCATED]")
+            assert len(result.namespace_vars['my_list']) <= 500
 
 
 class TestEnhancedErrors:

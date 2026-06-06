@@ -13,6 +13,36 @@ from contextlib import redirect_stdout, redirect_stderr
 
 from .models import ExecutionResult, ExceptionInfo, TruncationInfo, WarningInfo
 
+
+class _BufferProxy:
+    """Bytes facade over a StringIO capture (sys.stdout.buffer compatibility)."""
+
+    def __init__(self, sio: StringIO):
+        self._sio = sio
+
+    def write(self, data: bytes) -> int:
+        self._sio.write(data.decode("utf-8", "replace"))
+        return len(data)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        pass
+
+
+class _CaptureIO(StringIO):
+    """StringIO with a .buffer attribute, like a real text stdout.
+
+    Libraries that write binary via sys.stdout.buffer (progress bars, image
+    pipes) otherwise die with AttributeError mid-cell.
+    """
+
+    @property
+    def buffer(self) -> _BufferProxy:
+        return _BufferProxy(self)
+
 # Reserved names that should be excluded from namespace output
 # and preserved during reset
 RESERVED_NAMES = frozenset({
@@ -38,18 +68,22 @@ TRUNCATION_SUFFIX = "\n... [TRUNCATED]"
 def _smart_truncate(
     content: str,
     max_size: int,
-    suffix: str = TRUNCATION_SUFFIX
+    suffix: str = TRUNCATION_SUFFIX,
+    tail_fraction: float = 0.25,
 ) -> tuple[str, TruncationInfo]:
     """
-    Intelligently truncate content while preserving structure.
+    Truncate content keeping the HEAD and the TAIL, dropping the middle.
 
-    For multi-line content, tries to preserve complete lines.
-    For single-line content, truncates at max_size.
+    Agents print progress first and summaries last — head-only truncation
+    discards the most valuable bytes. The omitted-count marker sits where
+    the middle was cut. Line boundaries are preserved when possible.
 
     Args:
         content: String to truncate
         max_size: Maximum size in characters
-        suffix: Suffix to append when truncated
+        suffix: Marker label (kept for API compat; the rendered marker
+                includes the omitted character count)
+        tail_fraction: Share of the budget reserved for the tail
 
     Returns:
         Tuple of (truncated_content, truncation_info)
@@ -64,34 +98,46 @@ def _smart_truncate(
             truncation_type="hard",
         )
 
-    # Adjust max_size to account for suffix
-    effective_max = max_size - len(suffix)
+    marker = f"\n... [TRUNCATED — {original_size - max_size}+ chars omitted] ...\n"
+    effective_max = max_size - len(marker)
+    tail_budget = int(effective_max * tail_fraction)
+    head_budget = effective_max - tail_budget
 
-    # Try smart truncation (preserve line boundaries)
     truncation_type = "smart"
     if "\n" in content:
-        lines = content.split("\n")
-        kept_lines = []
-        current_size = 0
-
-        for line in lines:
-            line_size = len(line) + 1  # +1 for newline
-            if current_size + line_size <= effective_max:
-                kept_lines.append(line)
-                current_size += line_size
-            else:
+        # Head: whole lines from the start
+        head_lines = []
+        current = 0
+        for line in content.split("\n"):
+            line_size = len(line) + 1
+            if current + line_size > head_budget:
                 break
+            head_lines.append(line)
+            current += line_size
+        head = "\n".join(head_lines)
+        if not head:
+            head = content[:head_budget]
+            truncation_type = "hard"
 
-        if kept_lines:
-            truncated = "\n".join(kept_lines) + suffix
-        else:
-            # First line alone is too long, fall back to hard truncation
-            truncated = content[:effective_max] + suffix
+        # Tail: whole lines from the end
+        tail_lines = []
+        current = 0
+        for line in reversed(content.split("\n")):
+            line_size = len(line) + 1
+            if current + line_size > tail_budget:
+                break
+            tail_lines.append(line)
+            current += line_size
+        tail = "\n".join(reversed(tail_lines))
+        if not tail and tail_budget > 0:
+            tail = content[-tail_budget:]
             truncation_type = "hard"
     else:
-        # Single line, hard truncate
-        truncated = content[:effective_max] + suffix
+        head = content[:head_budget]
+        tail = content[-tail_budget:] if tail_budget > 0 else ""
         truncation_type = "hard"
+
+    truncated = head + marker + tail
 
     return truncated, TruncationInfo(
         truncated=True,
@@ -176,6 +222,27 @@ def _detect_common_errors(
     # ImportError: suggest installing into the server venv
     elif exc_type in ["ImportError", "ModuleNotFoundError"]:
         hints.append("Module not installed in the REPL server's venv — install it via sh('uv pip install <pkg>') or use the Bash tool")
+
+    # Cross-call async resource trap: each call runs its own event loop
+    elif exc_type == "RuntimeError" and (
+        "Event loop is closed" in exc_msg
+        or "attached to a different loop" in exc_msg
+        or "different event loop" in exc_msg
+    ):
+        hints.append(
+            "Each execute_python call runs its own event loop — async resources "
+            "(httpx clients, tasks, locks) created in a previous call are bound to "
+            "a closed loop. Recreate them in this call, or use sync APIs for "
+            "objects that must persist across calls"
+        )
+
+    # multiprocessing inside the kernel: the kernel child is daemonic
+    elif exc_type == "AssertionError" and "daemonic" in exc_msg:
+        hints.append(
+            "The REPL kernel is a daemonic process — multiprocessing workers can't "
+            "be spawned here. Use concurrent.futures.ThreadPoolExecutor for "
+            "parallelism, or sh() to run parallel CLI commands"
+        )
 
     # ZeroDivisionError: generic hint
     elif exc_type == "ZeroDivisionError":
@@ -306,14 +373,23 @@ class REPLEngine:
         # Large-namespace warning fires once per session (reset clears it)
         self._namespace_warning_emitted = False
 
+        # Original helper objects, kept so reset_namespace() can restore them
+        # even if a cell rebound the names (`sh = 'oops'`)
+        self._injected: dict[str, Any] = {}
+        # Helper names already warned about (avoid repeating every call)
+        self._shadow_warned: set[str] = set()
+
         # Inject MCP wrapper
         if mcp_wrapper:
             self.globals["mcp"] = mcp_wrapper
+            self._injected["mcp"] = mcp_wrapper
 
         # Inject shell helper bound to workspace root
         try:
             from .utilities.shell import make_sh
-            self.globals["sh"] = make_sh(self.workspace_root)
+            bound_sh = make_sh(self.workspace_root)
+            self.globals["sh"] = bound_sh
+            self._injected["sh"] = bound_sh
         except Exception:
             pass  # Shell helper init failed, skip
 
@@ -335,8 +411,8 @@ class REPLEngine:
             ExecutionResult with captured output and execution status
         """
         start_time = time.perf_counter()
-        stdout_capture = StringIO()
-        stderr_capture = StringIO()
+        stdout_capture = _CaptureIO()
+        stderr_capture = _CaptureIO()
         return_value = None
         exception_info = None
         success = True
@@ -381,16 +457,42 @@ class REPLEngine:
                 hints=["Raise the timeout parameter for long-running async work"],
                 similar_names=[],
             )
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
+            success = False
+            user_message = str(e)
+            if user_message:
+                # Raised by the user's own code (SIGINT interrupts carry no
+                # message) — report it as their exception, not as a timeout.
+                exception_info = ExceptionInfo(
+                    type="KeyboardInterrupt",
+                    message=user_message,
+                    traceback=_format_repl_traceback(e),
+                    hints=[],
+                    similar_names=[],
+                )
+            else:
+                exception_info = ExceptionInfo(
+                    type="KeyboardInterrupt",
+                    message=(
+                        "execution interrupted. Namespace state up to the "
+                        "interrupt is preserved."
+                    ),
+                    traceback="KeyboardInterrupt\n",
+                    hints=[],
+                    similar_names=[],
+                )
+        except asyncio.CancelledError:
             success = False
             exception_info = ExceptionInfo(
-                type="KeyboardInterrupt",
-                message=(
-                    "execution interrupted. Namespace state up to the "
-                    "interrupt is preserved."
-                ),
-                traceback="KeyboardInterrupt\n",
-                hints=[],
+                type="CancelledError",
+                message="awaited task or future was already cancelled",
+                traceback="CancelledError\n",
+                hints=[
+                    "Background tasks don't survive across calls — each "
+                    "execute_python call runs its own event loop, which cancels "
+                    "pending tasks when the cell ends. Create and await tasks "
+                    "within a single call"
+                ],
                 similar_names=[],
             )
         except SyntaxError as e:
@@ -436,7 +538,26 @@ class REPLEngine:
         stderr_str = stderr_capture.getvalue()
         stderr_truncated, stderr_info = _smart_truncate(stderr_str, MAX_STDERR_SIZE)
 
-        return_value_str = repr(return_value) if return_value is not None else None
+        # repr() runs user __repr__ code — a raising __repr__ must not be
+        # reported as a failure of the (successful) cell itself.
+        return_value_str = None
+        repr_warning = None
+        if return_value is not None:
+            try:
+                return_value_str = repr(return_value)
+            except Exception as repr_exc:
+                return_value_str = (
+                    f"<{type(return_value).__name__} object — repr() raised "
+                    f"{type(repr_exc).__name__}: {repr_exc}>"
+                )
+                repr_warning = WarningInfo(
+                    category="repr_failed",
+                    message=(
+                        f"The cell succeeded, but formatting its return value failed: "
+                        f"repr() raised {type(repr_exc).__name__}: {repr_exc}"
+                    ),
+                    suggestion="The value is stored in the namespace; inspect it field by field",
+                )
         return_value_truncated = None
         return_value_info = None
         if return_value_str:
@@ -456,6 +577,41 @@ class REPLEngine:
             stderr_info,
             return_value_info
         )
+
+        if repr_warning is not None:
+            warnings.append(repr_warning)
+
+        # Non-UTF-8-encodable text (lone surrogates) is replaced at the model
+        # boundary (see models.utf8_safe) — warn so the '?' marks are explained
+        for label, text in (("stdout", stdout_str), ("stderr", stderr_str),
+                            ("return_value", return_value_str or "")):
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                warnings.append(WarningInfo(
+                    category="encoding_sanitized",
+                    message=(
+                        f"{label} contained characters that can't be encoded as "
+                        "UTF-8 (e.g. lone surrogates) — they were replaced with '?'"
+                    ),
+                    suggestion="Decode binary data with errors='replace' instead of 'surrogateescape'",
+                ))
+
+        # Helper shadowing: a cell that rebinds sh/mcp silently breaks the
+        # helpers for the rest of the session — say so once per shadow
+        for name, original in self._injected.items():
+            if self.globals.get(name) is not original:
+                if name not in self._shadow_warned:
+                    self._shadow_warned.add(name)
+                    warnings.append(WarningInfo(
+                        category="helper_shadowed",
+                        message=(
+                            f"'{name}' was overwritten and no longer refers to the "
+                            f"built-in helper. Use reset=True to restore it"
+                        ),
+                    ))
+            else:
+                self._shadow_warned.discard(name)
 
         # Large-namespace warning: fire once per session, not on every call
         namespace_size = len(namespace_vars)
@@ -614,20 +770,19 @@ class REPLEngine:
         return namespace_vars, truncation_info
 
     def reset_namespace(self) -> None:
-        """Reset namespace to initial state, preserving injected utilities."""
-        # Save utilities
-        saved = {}
-        for name in RESERVED_NAMES:
-            if name in self.globals and name != "__builtins__":
-                saved[name] = self.globals[name]
+        """Reset namespace to initial state, restoring injected helpers.
 
-        # Clear and restore
+        Restores the ORIGINAL sh/mcp objects (not whatever is currently bound
+        to those names) so a cell that shadowed a helper (`sh = 'oops'`) is
+        fully recoverable via reset=True.
+        """
         self.globals.clear()
         self.globals["__builtins__"] = __builtins__
-        self.globals.update(saved)
+        self.globals.update(self._injected)
 
         # Fresh namespace may warn again when it grows large
         self._namespace_warning_emitted = False
+        self._shadow_warned.clear()
 
     def get_namespace_vars(self) -> dict[str, str]:
         """Get current namespace variables (excluding reserved names)."""

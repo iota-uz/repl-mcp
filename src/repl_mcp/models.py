@@ -1,7 +1,38 @@
 """Data models for REPL MCP server."""
 
 from typing import Optional, Literal, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+# Exception text caps — exceptions bypass the engine's stdout/return-value
+# truncation, so they get their own (a 1MB assertion diff must not flood the
+# agent's context in one response).
+MAX_EXCEPTION_MESSAGE_SIZE = 10_000
+MAX_EXCEPTION_TRACEBACK_SIZE = 20_000
+
+
+def utf8_safe(text: str) -> str:
+    """
+    Make a string strictly UTF-8 encodable (replace lone surrogates etc.).
+
+    Critical invariant: any non-encodable character that reaches the MCP
+    response kills the stdio writer task (PydanticSerializationError inside
+    mcp's stdout_writer) and permanently wedges the server — every later tool
+    call hangs. Surrogates arrive via surrogateescape decoding (os.fsdecode,
+    weird filenames), broken UTF-16 handling, or malformed JSON.
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _cap(text: str, max_size: int) -> str:
+    """Hard-cap a string with an explicit omitted-count marker."""
+    if len(text) <= max_size:
+        return text
+    marker = f"\n... [TRUNCATED — {len(text) - max_size} chars omitted]"
+    return text[: max_size - len(marker)] + marker
 
 
 class TruncationInfo(BaseModel):
@@ -52,6 +83,26 @@ class ExceptionInfo(BaseModel):
         description="The line of code that caused the error"
     )
 
+    @field_validator("message", mode="after")
+    @classmethod
+    def _sanitize_message(cls, v: str) -> str:
+        return _cap(utf8_safe(v), MAX_EXCEPTION_MESSAGE_SIZE)
+
+    @field_validator("traceback", mode="after")
+    @classmethod
+    def _sanitize_traceback(cls, v: str) -> str:
+        return _cap(utf8_safe(v), MAX_EXCEPTION_TRACEBACK_SIZE)
+
+    @field_validator("context_line", mode="after")
+    @classmethod
+    def _sanitize_context(cls, v: Optional[str]) -> Optional[str]:
+        return utf8_safe(v) if v is not None else None
+
+    @field_validator("hints", "similar_names", mode="after")
+    @classmethod
+    def _sanitize_lists(cls, v: list[str]) -> list[str]:
+        return [utf8_safe(item) for item in v]
+
 
 class ExecutionResult(BaseModel):
     """Result of executing Python code in the REPL."""
@@ -92,30 +143,62 @@ class ExecutionResult(BaseModel):
         description="Non-fatal warnings about execution"
     )
 
+    @field_validator("stdout", "stderr", mode="after")
+    @classmethod
+    def _sanitize_streams(cls, v: str) -> str:
+        return utf8_safe(v)
+
+    @field_validator("return_value", mode="after")
+    @classmethod
+    def _sanitize_return(cls, v: Optional[str]) -> Optional[str]:
+        return utf8_safe(v) if v is not None else None
+
+    @field_validator("namespace_vars", mode="after")
+    @classmethod
+    def _sanitize_namespace(cls, v: dict[str, str]) -> dict[str, str]:
+        return {k: utf8_safe(val) for k, val in v.items()}
+
     def __str__(self) -> str:
         """Format as human-readable plain text output."""
         parts = []
 
-        # Error case
-        if not self.success and self.exception:
-            exc = self.exception
-            parts.append(f"{exc.type}: {exc.message}")
-            if exc.traceback:
-                # Show abbreviated traceback (skip the wrapper frames)
-                parts.append(exc.traceback.strip())
-            if exc.hints:
-                parts.append("")
-                for hint in exc.hints:
-                    parts.append(f"Hint: {hint}")
-            return "\n".join(parts)
-
-        # Success case
+        # Output captured before a failure is still valuable (debug prints) —
+        # show it in both the success and error cases.
         if self.stdout:
             parts.append(self.stdout.rstrip())
 
         if self.stderr:
             parts.append(f"[stderr] {self.stderr.rstrip()}")
 
+        # Error case
+        if not self.success and self.exception:
+            exc = self.exception
+            summary = f"{exc.type}: {exc.message}" if exc.message else exc.type
+            if parts:
+                parts.append("")
+            parts.append(summary)
+
+            # Skip tracebacks that add nothing beyond the summary line
+            # (KeyboardInterrupt, SystemExit, KernelRestarted, ...) — they
+            # would render as a bare duplicate of the message.
+            def _norm(s: str) -> str:
+                return s.rstrip(": \n")
+
+            tb = (exc.traceback or "").strip()
+            if tb and _norm(tb) not in (_norm(summary), exc.type) \
+                    and not _norm(summary).startswith(_norm(tb)):
+                parts.append(tb)
+
+            if exc.hints:
+                parts.append("")
+                for hint in exc.hints:
+                    parts.append(f"Hint: {hint}")
+
+            for w in self.warnings:
+                parts.append(f"⚠ {w.message}")
+            return "\n".join(parts)
+
+        # Success case
         if self.return_value is not None and self.return_value != "None":
             if parts:
                 parts.append("")  # blank line before return value
