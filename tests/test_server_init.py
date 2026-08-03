@@ -85,6 +85,29 @@ def test_list_namespace_vars_via_engine():
     assert "test_var" in vars_dict
 
 
+def test_mcp_bridge_survives_a_truncated_description():
+    """
+    Regression test: the `mcp` bridge must be visible in the FIRST few hundred
+    characters of the tool description.
+
+    Clients that defer tools show agents only a truncated description — in the
+    wild, everything from "Helpers:" on was cut, so the agent never learned the
+    bridge existed and fell back to 138 individual tool calls. Keep the bridge
+    in the opening paragraph.
+
+    If this fails, someone pushed the mcp mention further down - move it back.
+    """
+    import asyncio
+
+    server = repl_mcp_server.create_server(autoconnect=False)
+    tools = asyncio.run(server.get_tools())
+    description = next(iter(tools.values())).description
+
+    head = description[:400]
+    assert "mcp" in head, f"mcp bridge missing from the first 400 chars:\n{head}"
+    assert "mcp.call" in head, f"no callable example in the first 400 chars:\n{head}"
+
+
 def test_execute_python_no_return_annotation():
     """
     Regression test: execute_python must NOT have a return type annotation.

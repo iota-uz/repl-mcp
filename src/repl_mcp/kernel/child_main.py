@@ -40,6 +40,30 @@ def _sigint_handler(signum, frame):
     # Idle: swallow — the control loop must survive stray interrupts.
 
 
+class ServerList(list):
+    """
+    Available MCP servers.
+
+    A plain list for every practical purpose (membership, iteration, indexing)
+    — only the repr differs, because the REPL echoes return values and a bare
+    `['github', 'telegram-mcp']` reads as "these are running". They are
+    *discovered*; naming one in mcp.call() is what starts it.
+    """
+
+    def __init__(self, names, connected=()):
+        super().__init__(names)
+        self.connected = list(connected)
+
+    def __repr__(self) -> str:
+        base = super().__repr__()
+        if not self:
+            return base
+        # Angle-bracket form on purpose: a trailing "# comment" would produce
+        # nonsense once this is nested in a tuple/dict repr.
+        live = "all" if all(n in self.connected for n in self) else repr(self.connected)
+        return f"<available: {base} | live: {live}>"
+
+
 class ChildMcpProxy:
     """
     The `mcp` object inside the kernel child.
@@ -81,7 +105,8 @@ class ChildMcpProxy:
         Discovered, not necessarily connected — a server starts on its first
         mcp.call(). See mcp.help() for per-server status.
         """
-        return self._request(MCP_STATE, {}, wait_s=70.0)["servers"]
+        state = self._request(MCP_STATE, {}, wait_s=70.0)
+        return ServerList(state["servers"], state.get("connected") or [])
 
     @property
     def failed(self) -> dict:
@@ -100,7 +125,18 @@ class ChildMcpProxy:
         return ["servers", "failed", "call", "list_tools", "help"]
 
     def __repr__(self):
-        return "<mcp bridge: call(server, tool, **args) / servers / failed / help()>"
+        # Naming the servers here is the cheapest way for an agent that just
+        # types `mcp` to learn what it can reach. Best-effort: a bridge that
+        # can't answer must still have a usable repr.
+        try:
+            state = self._request(MCP_STATE, {}, wait_s=5.0)
+            names = ", ".join(state.get("servers") or []) or "none discovered"
+        except Exception:
+            names = "see mcp.servers"
+        return (
+            f"<mcp bridge → {names} | mcp.call(server, tool, **args) starts one "
+            "on demand; print(mcp.help()) for scope + status>"
+        )
 
     # -- plumbing --------------------------------------------------------
 

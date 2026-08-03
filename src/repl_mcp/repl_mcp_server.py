@@ -216,8 +216,11 @@ def create_server(
         timeout: float = 120.0,
     ):
         """
-        Persistent Python REPL — use this instead of `python3 -c`, heredocs,
-        or `cmd | python3` via Bash.
+        Persistent Python REPL — use instead of `python3 -c`, heredocs or
+        `cmd | python3` via Bash. Also the way to BATCH MCP WORK: the injected
+        `mcp` bridge reaches your project, global (user-scope) and plugin MCP
+        servers, so one loop replaces N separate tool calls —
+        `for f in files: mcp.call('telegram-mcp', 'download_media', **f)`.
 
         State (variables, imports, functions) survives across calls: a warm
         call takes ~0.1s vs ~3s for each fresh `python3` Bash spawn. Full

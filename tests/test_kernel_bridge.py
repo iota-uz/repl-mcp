@@ -104,7 +104,8 @@ class TestBridgeOverIPC:
         sup, wrapper, _ = bridged_kernel
         r = await run(sup, "(mcp.servers, mcp.failed)")
         assert r.success, r.exception
-        assert r.return_value == "(['child'], {})"
+        # Nested repr must stay readable — no dangling "# comment" inside a tuple
+        assert r.return_value == "(<available: ['child'] | live: []>, {})"
 
     async def test_failed_server_reported_through_proxy(self, bridged_kernel):
         sup, wrapper, _ = bridged_kernel
@@ -142,6 +143,32 @@ class TestBridgeOverIPC:
         r = await run(sup, "mcp.call('child', 'echo', text=object())")
         assert not r.success
         assert "JSON-serializable" in r.exception.message
+
+    async def test_repr_tells_the_agent_what_is_reachable(self, bridged_kernel):
+        """`mcp` echoed in a cell must name its servers, not just its methods."""
+        sup, _, calls = bridged_kernel
+        r = await run(sup, "mcp")
+        assert r.success, r.exception
+        assert "child" in r.return_value
+        assert "on demand" in r.return_value
+        assert calls["n"] == 0
+
+    async def test_servers_repr_marks_them_as_not_yet_started(self, bridged_kernel):
+        """A bare ['child'] reads as 'running' — the repr must say otherwise."""
+        sup, _, _ = bridged_kernel
+        r = await run(sup, "mcp.servers")
+        assert r.success, r.exception
+        assert r.return_value == "<available: ['child'] | live: []>"
+
+        await run(sup, "mcp.call('child', 'echo', text='x')")
+        r2 = await run(sup, "mcp.servers")
+        assert r2.return_value == "<available: ['child'] | live: all>"
+
+    async def test_servers_still_behaves_like_a_list(self, bridged_kernel):
+        sup, _, _ = bridged_kernel
+        r = await run(sup, "('child' in mcp.servers, len(mcp.servers), sorted(mcp.servers))")
+        assert r.success, r.exception
+        assert r.return_value == "(True, 1, ['child'])"
 
     async def test_state_queries_never_connect(self, bridged_kernel):
         sup, _, calls = bridged_kernel

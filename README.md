@@ -40,7 +40,7 @@ To update later: `/plugin marketplace update repl-mcp` then `/plugin update pyth
 ### Claude Code (MCP server only)
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.0 repl-mcp
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.1 repl-mcp
 ```
 
 Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
@@ -48,7 +48,7 @@ Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.0 repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.1 repl-mcp
 ```
 
 ### Claude Desktop
@@ -60,7 +60,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.1.0", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.1.1", "repl-mcp"]
     }
   }
 }
@@ -140,6 +140,16 @@ MCP client ── stdio ──► PARENT (FastMCP, pure async)        CHILD (own
 ```
 
 The server's event loop never blocks on REPL code; in-cell `mcp.*` calls are serviced on an independent channel while the cell runs. See `CLAUDE.md` for the full development guide.
+
+## v2.1.1 changes
+
+Discoverability fixes — v2.1.0 made global servers reachable, but an agent still had to *know* that:
+
+- The `mcp` bridge is named in the **first paragraph** of the `execute_python` description. Clients
+  that defer tools show agents a truncated description; everything from `Helpers:` down was being cut,
+  so the bridge was invisible exactly when it mattered
+- `repr(mcp)` now names the reachable servers instead of just listing its own methods
+- `mcp.servers` renders as `<available: [...] | live: [...]>` — a bare list read as "these are running"
 
 ## v2.1.0 changes
 
