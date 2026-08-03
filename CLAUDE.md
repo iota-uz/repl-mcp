@@ -10,7 +10,7 @@ MCP server (FastMCP) exposing one tool — `execute_python`, a persistent Python
 - **Top-level `await`** — cells compile with `PyCF_ALLOW_TOP_LEVEL_AWAIT` (IPython autoawait-style); async cells are cancellable at `timeout`
 - **`sh()` helper** — shell composition replacing `cmd | python3 -c` pipelines
 - **Full filesystem access** — `open()`, absolute paths, `~` all work; cwd = the user's project
-- **MCP bridge** — `mcp.call/servers/failed/list_tools/help` reach servers from the *project's* `.mcp.json`; connection is **lazy** (first `mcp.*` use), so sessions that never touch the bridge spawn zero child MCP servers
+- **MCP bridge** — `mcp.call/servers/failed/list_tools/help` reach servers from **every Claude Code config scope** (local, project `.mcp.json`, user `~/.claude.json`, enabled plugins — see `mcp_config.py`); connection is **per server, on demand** (naming it in `mcp.call` starts it), so sessions that never touch the bridge spawn zero child MCP servers
 - **Claude Code plugin** — `.claude-plugin/` + `skills/` + `hooks/` bundle the server, a usage skill, and a Bash-nudge hook
 
 Transport: **stdio only** (SSE was removed in v2.0.0).
@@ -45,7 +45,8 @@ Key invariants:
 src/repl_mcp/
 ├── repl_mcp_server.py    # FastMCP server, lifespan, execute_python tool
 ├── repl_engine.py        # Engine: cell compile/exec, capture, hints, truncation
-├── mcp_client_wrapper.py # Parent-side MCP sessions (call/list_tools/help/failed)
+├── mcp_client_wrapper.py # Parent-side MCP sessions + registry, on-demand connect
+├── mcp_config.py         # Multi-scope discovery (local/project/user/plugin), self-exclusion
 ├── models.py             # ExecutionResult/ExceptionInfo/ServerConfig/...
 ├── kernel/
 │   ├── protocol.py       # Frame + message kinds, JSON-only payloads
@@ -64,9 +65,10 @@ uv sync --extra dev
 Run the server (stdio is the only transport):
 
 ```bash
-uv run repl-mcp                      # autoconnect config: ./.mcp.json (lazy)
-uv run repl-mcp --no-autoconnect     # disable the mcp bridge config
-uv run repl-mcp --config .mcp.dev.json
+uv run repl-mcp                        # all scopes: local/project/user/plugin (on demand)
+uv run repl-mcp --mcp-scope project    # only ./.mcp.json (pre-2.1 behaviour)
+uv run repl-mcp --mcp-scope none       # disable the mcp bridge (== --no-autoconnect)
+uv run repl-mcp --config .mcp.dev.json # override the *project*-scope file only
 ```
 
 Quick protocol smoke test:
@@ -86,14 +88,15 @@ Test map:
 - `test_repl_engine.py` — engine in-process (incl. top-level await, traceback stripping)
 - `test_kernel_protocol.py` — IPC frame loopback (no subprocess)
 - `test_kernel.py` — kernel acceptance: state round-trip, interrupt-survives, grace-kill restart, segfault isolation, restart notice
-- `test_kernel_bridge.py` — mcp bridge over IPC incl. lazy connect and interrupt-mid-call
+- `test_mcp_config.py` — multi-scope discovery: precedence, deny lists, plugins, self-exclusion, `${VAR}` expansion (hermetic — fake `home`/`cwd`, never reads the real `~/.claude.json`)
+- `test_kernel_bridge.py` — mcp bridge over IPC incl. on-demand connect, negative cache and interrupt-mid-call
 - `test_cross_thread_bridge.py` — parent-side wrapper loop-affinity contract
 - `test_claude_code_integration.py` — spawns the real server over stdio
 - fixtures: `tests/fixtures/child_mcp_server.py` (echo + slow tools)
 
 ## Configuration Files
 
-**`.mcp.dev.json`** — dev-only MCP config for working *in this repo* (renamed from `.mcp.json` so it isn't auto-discovered as the plugin's MCP bundle). At runtime in user projects, the server reads the *user project's* `.mcp.json` (cwd-relative) and connects lazily on first `mcp.*` use.
+**`.mcp.dev.json`** — dev-only MCP config for working *in this repo* (renamed from `.mcp.json` so it isn't auto-discovered as the plugin's MCP bundle); pass it via `--config` to override the project scope. At runtime the server merges the user project's `.mcp.json` (cwd-relative) with `~/.claude.json` (user + local scope) and enabled plugins, then connects each server on first use.
 
 **`.claude-plugin/plugin.json`** — Claude Code plugin manifest
 - Bundles the MCP server (`uvx --from git+...@vX.Y.Z` — pinned tag so uvx caches the build and cwd stays at the user's project; do NOT use `uv run --directory`, it chdirs), the `skills/python-repl` skill, and the `hooks/` nudge hook
@@ -120,6 +123,10 @@ git tag vX.Y.Z && git push && git push --tags
 - **Engine timeout semantics**: `REPLEngine.execute(timeout=...)` self-cancels only async cells; sync-cell enforcement belongs to the supervisor (SIGINT). Don't "fix" one without the other
 - **Supervisor recv**: the pending control-read future is shielded across the timeout → interrupt → grace sequence; a cancelled wait must not abandon the read or the RESULT frame is lost (see `execute()`)
 - **multiprocessing start method is spawn** (darwin-safe); child entrypoint must stay importable as `repl_mcp.kernel.child_main.child_serve`
+- **Bridge recursion**: discovery must never hand back an entry that starts this server. `is_self_server()` is the heuristic; `REPL_MCP_NO_BRIDGE=1` (injected into every spawned server's env) is the backstop that caps nesting at depth 1. Don't drop either
+- **Loop affinity**: `ensure_connected_async` must be awaited on the owner loop — the supervisor calls it directly in `_handle_rpc`, never through `run_in_executor`. `_pin_loop()` raises rather than silently rebinding, which is what made the old `mcp.help()` hang possible
+- **Connect budget**: on-demand connects are clamped to `MAX_ON_DEMAND_CONNECT_S` (30s) because the kernel child only waits `call timeout + 45s` for connect+call. Raising one without the other makes the child report a bogus "no reply from parent"
+- **Secrets**: `~/.claude.json` carries OAuth state and tokens. Read only `.mcpServers` / `.projects[cwd]`, and route anything user-facing through `redact()` — a config value must never reach logs or `mcp.help()`
 - **`reset=True`** clears the namespace in-place (keeps `sh`/`mcp`); a kernel *restart* is the heavyweight path and always carries the variables-cleared notice
 - Killing a wedged server: `pkill -f repl-mcp` (kernel children are daemonic and die with the parent)
 

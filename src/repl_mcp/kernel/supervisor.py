@@ -22,6 +22,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -53,6 +54,7 @@ class KernelSupervisor:
         *,
         interrupt_grace_s: float = 3.0,
         connect_servers: Optional[Callable] = None,
+        refresh_registry: Optional[Callable] = None,
     ):
         """
         Args:
@@ -62,13 +64,19 @@ class KernelSupervisor:
             interrupt_grace_s: how long to wait after SIGINT before the
                 hard kill + respawn
             connect_servers: optional async callable invoked once before the
-                first MCP RPC is served (lazy autoconnect hook)
+                first MCP RPC is served (legacy eager-connect hook; tests and
+                embedders use it — normal operation connects per server)
+            refresh_registry: optional async callable that re-runs config
+                discovery and re-registers it on the wrapper (used when the
+                REPL names a server we haven't seen yet)
         """
         self._mcp = mcp_wrapper
         self._workspace_root = workspace_root or Path.cwd()
         self._grace_s = interrupt_grace_s
         self._connect_servers = connect_servers
         self._connect_once: Optional[asyncio.Task] = None
+        self._refresh_registry = refresh_registry
+        self._last_refresh = 0.0
 
         self._proc: Optional[multiprocessing.process.BaseProcess] = None
         self._control = None  # parent end of control pipe
@@ -342,23 +350,32 @@ class KernelSupervisor:
 
             if frame.kind == MCP_CALL:
                 p = frame.payload
+                await self._ensure_server(p["server"])
                 value = await loop.run_in_executor(None, lambda: self._mcp.call(
                     p["server"], p["tool"], timeout=float(p.get("timeout", 60.0)),
                     **(p.get("kwargs") or {}),
                 ))
             elif frame.kind == MCP_LIST:
                 server = frame.payload.get("server")
+                if server:
+                    await self._ensure_server(server)
+                else:
+                    # Explicit "show me everything" — the one expensive path
+                    await self._connect_all()
                 value = await loop.run_in_executor(
                     None, lambda: self._mcp.list_tools(server)
                 )
             elif frame.kind == MCP_HELP:
                 p = frame.payload
+                if p.get("server"):
+                    await self._ensure_server(p["server"])
                 value = await loop.run_in_executor(
                     None, lambda: self._mcp.help(p.get("server"), p.get("tool"))
                 )
             elif frame.kind == MCP_STATE:
                 value = {
                     "servers": list(self._mcp.servers),
+                    "connected": list(getattr(self._mcp, "connected", [])),
                     "failed": dict(self._mcp.failed),
                 }
             else:
@@ -374,7 +391,7 @@ class KernelSupervisor:
             pass  # child died while we serviced the call
 
     async def _ensure_connected(self) -> None:
-        """Lazy autoconnect: run the connect hook once, on first MCP use."""
+        """Lazy autoconnect: run the eager-connect hook once, on first MCP use."""
         if self._connect_servers is None:
             return
         if self._connect_once is None:
@@ -383,3 +400,52 @@ class KernelSupervisor:
             await asyncio.shield(self._connect_once)
         except Exception as e:
             logger.warning("Lazy MCP autoconnect failed: %s", e)
+
+    async def _ensure_server(self, name: str) -> None:
+        """
+        Connect the one server the cell asked for.
+
+        Runs on the server event loop on purpose — sessions are loop-affine, so
+        the connect must NOT be pushed through run_in_executor.
+        """
+        ensure = getattr(self._mcp, "ensure_connected_async", None)
+        if ensure is None:  # wrapper without the registry (embedders/tests)
+            return
+
+        if self._mcp.resolve(name) is None:
+            await self._refresh_once()
+
+        if self._mcp.resolve(name) is None:
+            available = list(self._mcp.servers)
+            listing = ", ".join(available) if available else "(none discovered)"
+            raise ValueError(
+                f"MCP server '{name}' is not configured. Available: {listing}. "
+                "Run print(mcp.help()) to see scopes and connection status."
+            )
+
+        if not await ensure(name):
+            reason = self._mcp.failed.get(name, "connection failed")
+            raise RuntimeError(f"MCP server '{name}' failed to connect: {reason}")
+
+    async def _refresh_once(self) -> None:
+        """Re-run discovery (rate-limited) so mid-session config edits land."""
+        if self._refresh_registry is None:
+            return
+        now = time.monotonic()
+        if now - self._last_refresh < 5.0:
+            return
+        self._last_refresh = now
+        try:
+            await self._refresh_registry()
+        except Exception as e:
+            logger.warning("MCP config refresh failed: %s", e)
+
+    async def _connect_all(self) -> None:
+        """Connect every discovered server (mcp.list_tools() with no argument)."""
+        connect_all = getattr(self._mcp, "connect_all_async", None)
+        if connect_all is None:
+            return
+        try:
+            await connect_all()
+        except Exception as e:
+            logger.warning("Connect-all failed: %s", e)

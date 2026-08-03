@@ -55,7 +55,7 @@ async def test_help_from_worker_thread(connected_wrapper):
     result = await asyncio.wait_for(
         loop.run_in_executor(None, connected_wrapper.help), timeout=GUARD_S
     )
-    assert "child (2 tools)" in result
+    assert "child" in result and "2 tools" in result
     assert ".mcp.json" in result  # scope note present
 
 
@@ -86,5 +86,5 @@ async def test_failed_server_is_reported(connected_wrapper):
     help_text = await asyncio.wait_for(
         loop.run_in_executor(None, connected_wrapper.help), timeout=GUARD_S
     )
-    assert "Failed to connect:" in help_text
     assert "broken" in help_text
+    assert "Connection closed" in help_text  # failure reason, not just the name

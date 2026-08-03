@@ -3,9 +3,8 @@
 import asyncio
 import logging
 import os
-import re
-import subprocess
-import sys
+import time
+from pathlib import Path
 from typing import Any, Optional
 from contextlib import AsyncExitStack
 
@@ -15,9 +14,20 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from .models import ServerConfig
+from .mcp_config import (
+    DiscoveredServer,
+    DiscoveryResult,
+    expand_config,
+    expand_value,
+    format_registry,
+    spawn_env,
+)
 
-
-_ENV_REF = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
+# Hard ceiling for an on-demand connect. A server's own `timeout_s` may be
+# larger, but the kernel child only waits `call timeout + 45s` for the whole
+# connect+call round trip — a 90s connect would blow that budget and leave the
+# child reporting a bogus "no reply from parent".
+MAX_ON_DEMAND_CONNECT_S = 30.0
 
 
 def _expand_env_value(value: str) -> str:
@@ -27,17 +37,11 @@ def _expand_env_value(value: str) -> str:
 
     Unset vars without a default expand to "" with a warning.
     """
-
-    def repl(m: re.Match) -> str:
-        var, default = m.group(1), m.group(2)
-        if var in os.environ:
-            return os.environ[var]
-        if default is not None:
-            return default
+    unresolved: list[str] = []
+    expanded = expand_value(value, unresolved=unresolved)
+    for var in unresolved:
         logger.warning("Env var %s referenced in config but not set", var)
-        return ""
-
-    return _ENV_REF.sub(repl, value)
+    return expanded
 
 
 def _failure_reason(exc: BaseException) -> str:
@@ -68,9 +72,17 @@ logger = logging.getLogger(__name__)
 
 
 class MCPClientWrapper:
-    """Synchronous wrapper around MCP client sessions (call/list_tools/help)."""
+    """
+    Synchronous wrapper around MCP client sessions (call/list_tools/help).
 
-    def __init__(self):
+    Holds a *registry* of every discovered server (see `mcp_config`) and
+    connects them ONE AT A TIME, on demand: naming a server in `mcp.call()` is
+    what spawns it. With ~10 servers configured across scopes, connecting them
+    all up front would cost ~10 child processes and tens of seconds that most
+    sessions never need.
+    """
+
+    def __init__(self, *, connect_timeout_s: float = 20.0, negative_ttl_s: float = 60.0):
         self._sessions: dict[str, ClientSession] = {}
         self._exit_stacks: dict[str, AsyncExitStack] = {}
         self._errlogs: dict[str, Any] = {}  # Track errlog file handles
@@ -84,18 +96,80 @@ class MCPClientWrapper:
         # Connection failures by server name (reason string), for help()/servers
         self.failed: dict[str, str] = {}
 
+        # Discovered-but-not-connected servers
+        self._registry: Optional[DiscoveryResult] = None
+        self._extra: dict[str, DiscoveredServer] = {}  # registered at runtime
+        # In-flight connects, shared between concurrent waiters
+        self._connect_tasks: dict[str, asyncio.Task] = {}
+        # Failed connects are remembered for a while: without this, a loop like
+        # `for x in items: mcp.call('flaky', ...)` pays the full connect timeout
+        # on every iteration.
+        self._negative: dict[str, float] = {}
+        self._connect_timeout_s = connect_timeout_s
+        self._negative_ttl_s = negative_ttl_s
+
+    # -- registry ---------------------------------------------------------
+
+    def set_registry(self, result: DiscoveryResult) -> None:
+        """Install the discovered-server registry (connects nothing)."""
+        self._registry = result
+
+    def register_raw(
+        self,
+        servers: dict[str, dict],
+        *,
+        scope: str = "project",
+        origin: Optional[Path] = None,
+    ) -> None:
+        """Register server configs directly (tests, `--config`, embedders)."""
+        for name, config in servers.items():
+            self._extra[name] = DiscoveredServer(
+                name=name,
+                config=dict(config),
+                scope=scope,  # type: ignore[arg-type]
+                origin=origin or Path("<runtime>"),
+            )
+
+    def _known(self) -> dict[str, DiscoveredServer]:
+        known: dict[str, DiscoveredServer] = {}
+        if self._registry is not None:
+            known.update(self._registry.servers)
+        known.update(self._extra)
+        return known
+
+    def _registry_view(self) -> DiscoveryResult:
+        return DiscoveryResult(
+            servers=self._known(),
+            excluded=dict(self._registry.excluded) if self._registry else {},
+            sources=self._registry.sources if self._registry else (),
+        )
+
+    def resolve(self, name: str) -> Optional[DiscoveredServer]:
+        """Look up a discovered server by bare or qualified name."""
+        return self._known().get(name)
+
+    @property
+    def available(self) -> list[str]:
+        """Every discovered server name, connected or not."""
+        return sorted(self._known())
+
     @property
     def servers(self) -> list[str]:
         """
-        List connected server names (Python property, not tool call).
+        Available server names (Python property, not tool call).
 
-        Returns:
-            List of connected server names
+        These are *discovered*, not necessarily connected — a server starts on
+        its first `mcp.call()`. Connection status is shown by `mcp.help()`.
 
         Example:
             >>> mcp.servers
-            ['github', 'playwright']
+            ['github', 'railway', 'telegram-mcp']
         """
+        return self.available
+
+    @property
+    def connected(self) -> list[str]:
+        """Server names with a live session."""
         return list(self._sessions.keys())
 
     def __dir__(self):
@@ -157,19 +231,39 @@ class MCPClientWrapper:
         # Nothing connected yet: private loop is safe (no loop-affine state)
         return asyncio.run(coro)
 
+    def _pin_loop(self) -> None:
+        """
+        Bind sessions to the loop creating them — once.
+
+        Sessions and their anyio streams are loop-affine. Blindly reassigning
+        `_owner_loop` on a later connect would orphan the earlier sessions and
+        re-introduce the historical `mcp.help()` hang, so a second *running*
+        loop is a hard error. Rebinding is allowed only once the previous loop
+        is gone (fresh loop per test, server restart).
+        """
+        loop = asyncio.get_running_loop()
+        owner = self._owner_loop
+        if owner is None or owner is loop or not owner.is_running():
+            self._owner_loop = loop
+            return
+        raise RuntimeError(
+            "mcp bridge: sessions are pinned to another running event loop — "
+            "connect from the loop that owns the bridge"
+        )
+
     async def _connect_server(self, name: str, config: ServerConfig) -> bool:
-        """Connect to a single MCP server."""
+        """
+        Connect to a single MCP server.
+
+        `config` must already be `${VAR}`-expanded (see `_connect_entry`).
+        """
         try:
             exit_stack = AsyncExitStack()
             self._exit_stacks[name] = exit_stack
 
             if config.transport_type == "stdio":
-                # Prepare environment
-                env = os.environ.copy()
-                if config.env:
-                    # Expand environment variables in values
-                    for key, value in config.env.items():
-                        env[key] = _expand_env_value(value)
+                # Inherited env + the entry's own vars + the recursion guard
+                env = spawn_env({"env": config.env or {}})
 
                 # Create stdio transport
                 server_params = StdioServerParameters(
@@ -192,10 +286,7 @@ class MCPClientWrapper:
                 )
 
             else:  # HTTP transports
-                # Headers (e.g. Authorization: Bearer ${TOKEN}) with env expansion
-                headers = None
-                if config.headers:
-                    headers = {k: _expand_env_value(v) for k, v in config.headers.items()}
+                headers = dict(config.headers) if config.headers else None
 
                 if config.transport_type == "http":  # streamable HTTP
                     read, write, _ = await exit_stack.enter_async_context(
@@ -247,6 +338,126 @@ class MCPClientWrapper:
                 del self._errlogs[name]
             return False
 
+    async def _cleanup_partial(self, name: str) -> None:
+        """Tear down a half-built transport (timeout / cancelled connect)."""
+        if name in self._exit_stacks:
+            try:
+                await self._exit_stacks[name].aclose()
+            except BaseException as e:
+                logger.debug("Error closing partial connect for %s: %s", name, e)
+            self._exit_stacks.pop(name, None)
+        if name in self._errlogs:
+            try:
+                self._errlogs[name].close()
+            except Exception:
+                pass
+            del self._errlogs[name]
+
+    async def _connect_entry(
+        self, name: str, entry: DiscoveredServer, timeout_s: Optional[float]
+    ) -> bool:
+        """Expand, validate and connect one registry entry. Never raises."""
+        overrides = (
+            {"CLAUDE_PLUGIN_ROOT": str(entry.plugin_root)} if entry.plugin_root else None
+        )
+        expanded, unresolved = expand_config(entry.config, overrides=overrides)
+        if unresolved:
+            # An empty command would exec nothing and surface as a confusing
+            # FileNotFoundError — report the real cause instead.
+            self.failed[name] = "unset env var(s): " + ", ".join(unresolved)
+            self._negative[name] = time.monotonic() + self._negative_ttl_s
+            return False
+
+        try:
+            config = ServerConfig(**expanded)
+        except Exception as e:
+            self.failed[name] = f"invalid config: {type(e).__name__}: {e}"
+            self._negative[name] = time.monotonic() + self._negative_ttl_s
+            return False
+
+        if timeout_s is not None:
+            effective = timeout_s
+        else:
+            effective = config.timeout_s if config.timeout_s is not None else self._connect_timeout_s
+            effective = min(effective, MAX_ON_DEMAND_CONNECT_S)
+
+        try:
+            ok = await asyncio.wait_for(
+                self._connect_server(name, config), timeout=effective
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out connecting to %s after %.1fs", name, effective)
+            self.failed[name] = f"timed out after {effective:.0f}s"
+            await self._cleanup_partial(name)
+            ok = False
+        except asyncio.CancelledError:
+            await self._cleanup_partial(name)
+            raise
+        except Exception as e:
+            reason = _failure_reason(e)
+            logger.warning("Failed to connect to %s: %s", name, reason)
+            logger.debug("Connect failure for %s", name, exc_info=e)
+            self.failed[name] = reason
+            ok = False
+
+        if ok:
+            self._negative.pop(name, None)
+        else:
+            self.failed.setdefault(name, "connection failed (see server stderr log)")
+            self._negative[name] = time.monotonic() + self._negative_ttl_s
+        return ok
+
+    async def ensure_connected_async(
+        self,
+        name: str,
+        *,
+        force: bool = False,
+        timeout_s: Optional[float] = None,
+    ) -> bool:
+        """
+        Connect one server if it isn't already. Idempotent and concurrency-safe.
+
+        Must be awaited on the owner event loop (the supervisor's RPC handler
+        does exactly that) — sessions are loop-affine.
+
+        Args:
+            name: bare or qualified server name from the registry
+            force: retry even if a recent connect failed
+            timeout_s: explicit connect timeout (otherwise the entry's own
+                `timeout_s`, clamped to MAX_ON_DEMAND_CONNECT_S)
+
+        Returns:
+            True when a live session exists; False with `self.failed[name]` set.
+        """
+        self._pin_loop()
+
+        if name in self._sessions:
+            return True
+
+        if not force:
+            until = self._negative.get(name)
+            if until is not None and until > time.monotonic():
+                return False
+        else:
+            self._negative.pop(name, None)
+
+        task = self._connect_tasks.get(name)
+        if task is None or task.done():
+            entry = self.resolve(name)
+            if entry is None:
+                self.failed[name] = "not configured"
+                return False
+            task = asyncio.ensure_future(self._connect_entry(name, entry, timeout_s))
+            self._connect_tasks[name] = task
+
+        # shield: one waiter giving up (cell interrupted) must not cancel the
+        # connect for the others sharing it
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._connect_tasks.pop(name, None)
+
     async def connect_async(
         self,
         servers: dict[str, dict],
@@ -255,60 +466,51 @@ class MCPClientWrapper:
         sequential: bool = False,
     ) -> dict[str, bool]:
         """
-        Async connect to multiple MCP servers with timeouts.
+        Register and eagerly connect a set of servers.
+
+        Kept for tests, embedders and the explicit "connect everything" path
+        (`mcp.list_tools()` with no argument). Normal operation goes through
+        `ensure_connected_async` instead.
 
         Args:
             servers: Dict mapping server names to config dicts
-            timeout_s: Default per-server connect timeout
+            timeout_s: Per-server connect timeout
             sequential: If True, connect one-by-one (useful to reduce load)
 
         Returns:
             Dict mapping server names to connection success status (True/False)
         """
-        # Sessions become affine to the loop running this connect — record it
-        # so _run_async can route later sync calls (from REPL worker threads)
-        # back here.
-        self._owner_loop = asyncio.get_running_loop()
-
-        async def connect_one(name: str, config_dict: dict) -> tuple[str, bool]:
-            config = ServerConfig(**config_dict)
-            per_server_timeout = config.timeout_s if config.timeout_s is not None else timeout_s
-            try:
-                ok = await asyncio.wait_for(self._connect_server(name, config), timeout=per_server_timeout)
-                if not ok and name not in self.failed:
-                    self.failed[name] = "connection failed (see server stderr log)"
-                return name, ok
-            except asyncio.TimeoutError:
-                logger.warning("Timed out connecting to %s after %.1fs", name, per_server_timeout)
-                self.failed[name] = f"timed out after {per_server_timeout:.0f}s"
-                # Best-effort cleanup (covers partial initialization).
-                if name in self._exit_stacks:
-                    await self._exit_stacks[name].aclose()
-                    del self._exit_stacks[name]
-                if name in self._errlogs:
-                    try:
-                        self._errlogs[name].close()
-                    except Exception:
-                        pass
-                    del self._errlogs[name]
-                return name, False
-            except Exception as e:
-                reason = _failure_reason(e)
-                logger.warning("Failed to connect to %s: %s", name, reason)
-                logger.debug("Connect failure for %s", name, exc_info=e)
-                self.failed[name] = reason
-                return name, False
+        self._pin_loop()
+        self.register_raw(servers)
 
         results: dict[str, bool] = {}
 
         if sequential:
-            for name, config_dict in servers.items():
-                n, ok = await connect_one(name, config_dict)
-                results[n] = ok
+            for name in servers:
+                results[name] = await self.ensure_connected_async(
+                    name, force=True, timeout_s=timeout_s
+                )
             return results
 
-        tasks = [connect_one(name, config_dict) for name, config_dict in servers.items()]
-        for coro in asyncio.as_completed(tasks):
+        async def one(name: str) -> tuple[str, bool]:
+            return name, await self.ensure_connected_async(
+                name, force=True, timeout_s=timeout_s
+            )
+
+        for coro in asyncio.as_completed([one(name) for name in servers]):
+            name, ok = await coro
+            results[name] = ok
+        return results
+
+    async def connect_all_async(self, *, timeout_s: Optional[float] = None) -> dict[str, bool]:
+        """Connect every discovered server in parallel (the expensive path)."""
+        names = self.available
+
+        async def one(name: str) -> tuple[str, bool]:
+            return name, await self.ensure_connected_async(name, timeout_s=timeout_s)
+
+        results: dict[str, bool] = {}
+        for coro in asyncio.as_completed([one(name) for name in names]):
             name, ok = await coro
             results[name] = ok
         return results
@@ -324,6 +526,19 @@ class MCPClientWrapper:
             Dict mapping server names to connection success status
         """
         return self._run_async(self.connect_async(servers))
+
+    def _unreachable(self, server: str) -> str:
+        """Actionable message for a server that has no live session."""
+        if server in self.failed:
+            return f"Server '{server}' failed to connect: {self.failed[server]}"
+        if self.resolve(server) is not None:
+            return f"Server '{server}' is not connected yet"
+        available = self.available
+        listing = ", ".join(available) if available else "(none discovered)"
+        return (
+            f"Server '{server}' is not configured. Available: {listing}. "
+            "Run print(mcp.help()) to see scopes."
+        )
 
     def list_tools(self, server: Optional[str] = None) -> dict[str, list[str]]:
         """
@@ -382,36 +597,23 @@ class MCPClientWrapper:
             >>> print(mcp.help('github'))       # Show github tools
             >>> print(mcp.help('github', 'create_issue'))  # Show specific tool
         """
-        scope_note = (
-            "Servers come from this project's .mcp.json (autoconnect). "
-            "Host-level connectors (claude.ai Notion/GitHub, user-scope `claude mcp add` servers, plugins) "
-            "are NOT visible here — call those tools directly instead."
-        )
-
         if server is None:
-            # Show all servers
-            servers = list(self._sessions.keys())
-            if not servers and not self.failed:
-                return f"No MCP servers connected.\n\n{scope_note}"
-
-            output = "Connected MCP servers:\n" if servers else ""
-            tool_list = self.list_tools() if servers else {}
-            for srv in servers:
-                tools = tool_list.get(srv, [])
-                output += f"  {srv} ({len(tools)} tools)\n"
-            if self.failed:
-                output += "Failed to connect:\n"
-                for srv, reason in self.failed.items():
-                    output += f"  {srv}: {reason}\n"
-            output += "\nUse mcp.help('server') to see tools for a specific server"
-            output += "\nCall tools via mcp.call('server', 'tool', **args)"
-            output += f"\n\n{scope_note}"
-            return output
+            # Registry overview — connects nothing, so an agent can discover
+            # that e.g. telegram-mcp exists before paying to start it.
+            counts = {
+                name: len(tools) for name, tools in self.list_tools().items()
+            } if self._sessions else {}
+            return format_registry(
+                self._registry_view(),
+                connected=self.connected,
+                failed=self.failed,
+                tool_counts=counts,
+            )
 
         elif tool is None:
             # Show all tools for a server
             if server not in self._sessions:
-                return f"Server '{server}' not connected"
+                return self._unreachable(server)
 
             tool_list = self.list_tools(server)
             tools = tool_list.get(server, [])
@@ -428,7 +630,7 @@ class MCPClientWrapper:
         else:
             # Show specific tool help
             if server not in self._sessions:
-                return f"Server '{server}' not connected"
+                return self._unreachable(server)
 
             # Get tool schema
             async def get_tool_schema():
@@ -462,7 +664,7 @@ class MCPClientWrapper:
             asyncio.TimeoutError: If the tool call exceeds the timeout
         """
         if server not in self._sessions:
-            raise ValueError(f"Server '{server}' not connected")
+            raise ValueError(self._unreachable(server))
 
         async def call_tool():
             session = self._sessions[server]
@@ -485,6 +687,22 @@ class MCPClientWrapper:
         # Outer margin over the inner wait_for so the inner timeout fires first
         return self._run_async(call_tool(), timeout=timeout + 10.0)
 
+    def _nothing_to_disconnect(self, server: Optional[str]) -> bool:
+        if server is not None:
+            return server not in self._sessions and server not in self._connect_tasks
+        return not self._sessions and not self._connect_tasks
+
+    async def disconnect_async(self, server: Optional[str] = None) -> None:
+        """
+        Close sessions from the owner loop.
+
+        The sync `disconnect()` cannot be used from inside a running loop (the
+        server's own shutdown path) — it would try `asyncio.run()` there.
+        """
+        if self._nothing_to_disconnect(server):
+            return
+        await self._disconnect_impl(server)
+
     def disconnect(self, server: Optional[str] = None) -> None:
         """
         Disconnect from server(s).
@@ -492,8 +710,33 @@ class MCPClientWrapper:
         Args:
             server: Specific server to disconnect, or None to disconnect all
         """
+        # Nothing open: stay a no-op rather than spinning up a loop. A session
+        # that never touched the bridge must still shut down cleanly.
+        if self._nothing_to_disconnect(server):
+            return
+        self._run_async(self._disconnect_impl(server))
 
+    async def _disconnect_impl(self, server: Optional[str] = None) -> None:
         async def disconnect_all():
+            # Cancel in-flight connects first: closing an exit stack while
+            # enter_async_context is still running races the transport setup.
+            pending = (
+                [self._connect_tasks[server]] if server and server in self._connect_tasks
+                else list(self._connect_tasks.values()) if not server
+                else []
+            )
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if server:
+                self._connect_tasks.pop(server, None)
+            else:
+                self._connect_tasks.clear()
+
             servers_to_close = [server] if server else list(self._sessions.keys())
             for name in servers_to_close:
                 if name in self._exit_stacks:
@@ -516,7 +759,7 @@ class MCPClientWrapper:
                         pass
                     del self._errlogs[name]
 
-        self._run_async(disconnect_all())
+        await disconnect_all()
 
     def __del__(self):
         """Cleanup on deletion."""

@@ -1,6 +1,6 @@
 ---
 name: python-repl
-description: Use INSTEAD of running `python3 -c`, a `python3 - <<EOF` heredoc, or a `cmd | python3` pipeline via Bash — and for batch file operations, data aggregation, multi-step analysis where steps depend on each other, or orchestrating the project's MCP tools in one script. Guides effective use of the Python REPL MCP server (`execute_python`).
+description: Use INSTEAD of running `python3 -c`, a `python3 - <<EOF` heredoc, or a `cmd | python3` pipeline via Bash — and for batch file operations, data aggregation, multi-step analysis where steps depend on each other, or orchestrating MCP tools (project *or* global) in one script instead of many individual tool calls. Guides effective use of the Python REPL MCP server (`execute_python`).
 ---
 
 # Python REPL MCP — When and How
@@ -43,16 +43,25 @@ Full filesystem access. `open()`, `Path().read_text()`, absolute paths, and `~` 
 
 ## MCP bridge
 
-`mcp` reaches the MCP servers configured in the *project's* `.mcp.json` (it connects lazily on first use — expect the first call to take a few seconds):
+`mcp` reaches every MCP server Claude Code has configured — project (`./.mcp.json`), **user/global** (`~/.claude.json`, i.e. `claude mcp add -s user`), and plugin-provided. Each server starts the first time you name it (a few seconds), then stays warm:
 
 ```python
-mcp.servers                                  # connected server names
+mcp.servers                                  # available server names (any scope)
 mcp.failed                                   # connection failures with reasons
-print(mcp.help())                            # servers + tools overview
+print(mcp.help())                            # servers + scope + status; connects nothing
 mcp.call('github', 'create_issue', owner='me', repo='proj', title='Bug')
 ```
 
-Host-level connectors (claude.ai Notion/GitHub, user-scope `claude mcp add` servers) are **not** reachable here — call those tools directly. Arguments must be JSON-serializable.
+This is the reason to reach for the REPL when a task needs the *same* MCP tool many times — one loop replaces N tool calls:
+
+```python
+for f in files:
+    mcp.call('telegram-mcp', 'download_media', chat_id=f['chat'], message_id=f['id'])
+```
+
+Only claude.ai host connectors (Notion/Gmail/Drive/claude-in-chrome) are **not** reachable — those are server-managed with nothing on disk, so call their tools directly. Arguments must be JSON-serializable.
+
+If a server name isn't found, the error lists what *is* available — check `print(mcp.help())` rather than assuming the bridge is empty.
 
 ## Missing packages
 

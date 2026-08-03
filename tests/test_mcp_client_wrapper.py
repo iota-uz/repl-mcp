@@ -24,7 +24,15 @@ class TestMCPClientWrapperIntrospection:
         """Test that mcp.call() on an unknown server raises a clear error."""
         wrapper = MCPClientWrapper()
 
-        with pytest.raises(ValueError, match="not connected"):
+        with pytest.raises(ValueError, match="not configured"):
+            wrapper.call('github', 'create_issue', title='Bug')
+
+    def test_call_unknown_server_lists_available(self):
+        """The error must tell the agent what it *can* call."""
+        wrapper = MCPClientWrapper()
+        wrapper.register_raw({"telegram-mcp": {"command": "true"}})
+
+        with pytest.raises(ValueError, match="telegram-mcp"):
             wrapper.call('github', 'create_issue', title='Bug')
 
     def test_call_delegates_to_invoke_tool(self):

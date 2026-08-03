@@ -1,8 +1,8 @@
 {
   "name": "python-repl",
   "displayName": "Python REPL",
-  "version": "2.0.0",
-  "description": "Persistent Python REPL MCP server \u2014 use instead of python3 -c via Bash. Subprocess kernel with real timeouts (interrupt preserves state) and crash isolation, top-level await, sh() shell composition, full filesystem access, lazy MCP tool bridge.",
+  "version": "2.1.0",
+  "description": "Persistent Python REPL MCP server \u2014 use instead of python3 -c via Bash. Subprocess kernel with real timeouts (interrupt preserves state) and crash isolation, top-level await, sh() shell composition, full filesystem access, and an on-demand MCP bridge reaching your project, global and plugin servers.",
   "author": {
     "name": "iota-uz",
     "url": "https://github.com/iota-uz"
@@ -22,7 +22,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/iota-uz/repl-mcp@v2.0.0",
+        "git+https://github.com/iota-uz/repl-mcp@v2.1.0",
         "repl-mcp",
         "--transport",
         "stdio"

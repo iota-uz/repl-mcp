@@ -67,13 +67,20 @@ class ChildMcpProxy:
         return self._request(
             MCP_CALL,
             {"server": server, "tool": tool, "kwargs": kwargs, "timeout": timeout},
-            # Parent-side margin: connection setup (lazy autoconnect) + call
-            wait_s=timeout + 40.0,
+            # Parent-side margin: on-demand connect (clamped to 30s) + the call
+            # itself. Must exceed the parent's own budget or the child gives up
+            # first and reports a bogus "no reply from parent".
+            wait_s=timeout + 45.0,
         )
 
     @property
     def servers(self) -> list:
-        """List of connected server names."""
+        """
+        Available server names (discovered across all config scopes).
+
+        Discovered, not necessarily connected — a server starts on its first
+        mcp.call(). See mcp.help() for per-server status.
+        """
         return self._request(MCP_STATE, {}, wait_s=70.0)["servers"]
 
     @property

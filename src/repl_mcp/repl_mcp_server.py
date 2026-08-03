@@ -2,6 +2,7 @@
 
 import sys
 import json
+import asyncio
 import argparse
 import logging
 
@@ -14,6 +15,7 @@ from fastmcp import FastMCP
 from .repl_engine import REPLEngine  # noqa: F401  (re-export for tests/embedders)
 from .mcp_client_wrapper import MCPClientWrapper
 from .kernel.supervisor import KernelSupervisor
+from .mcp_config import ALL_SCOPES, discover_servers
 
 # Global instances
 mcp_wrapper: Optional[MCPClientWrapper] = None
@@ -55,6 +57,22 @@ def load_mcp_config(config_path: Path = Path(".mcp.json")) -> dict:
         return {}
 
 
+def parse_scopes(value: str) -> tuple[str, ...]:
+    """
+    Parse the --mcp-scope flag into a scope tuple.
+
+    'all' -> every scope, 'none'/'' -> no bridge, otherwise a comma-separated
+    subset of local,project,user,plugin (unknown names are ignored).
+    """
+    text = (value or "").strip().lower()
+    if text in ("", "none"):
+        return ()
+    if text == "all":
+        return ALL_SCOPES
+    wanted = [part.strip() for part in text.split(",")]
+    return tuple(s for s in ALL_SCOPES if s in wanted)
+
+
 def filter_servers(servers: dict, exclude: list[str] = None) -> dict:
     """
     Filter out servers by name.
@@ -76,14 +94,20 @@ def filter_servers(servers: dict, exclude: list[str] = None) -> dict:
     }
 
 
-def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger: logging.Logger):
+def create_server_lifespan(
+    config_path: Path,
+    autoconnect_enabled: bool,
+    logger: logging.Logger,
+    scopes: tuple[str, ...] = ALL_SCOPES,
+):
     """
     Factory to create a lifespan function with captured config.
 
     Args:
-        config_path: Path to .mcp.json config file
-        autoconnect_enabled: Whether to auto-connect to servers
+        config_path: Path to the project's .mcp.json (overrides project scope)
+        autoconnect_enabled: Whether the mcp bridge is available at all
         logger: Logger instance for output
+        scopes: config scopes to discover (see mcp_config.ALL_SCOPES)
 
     Returns:
         Async context manager for server lifespan
@@ -99,30 +123,36 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
 
         mcp_wrapper = MCPClientWrapper()
 
-        # LAZY autoconnect: configured servers connect on the first mcp.*
-        # use inside the REPL — most sessions never touch the bridge, so
-        # they spawn zero child MCP servers.
-        connect_servers = None
-        if autoconnect_enabled:
-            async def connect_servers():
-                servers = filter_servers(
-                    load_mcp_config(config_path), exclude=["python-repl"]
+        # Discovery is cheap (a few file reads) and spawns nothing, so it runs
+        # eagerly — `mcp.servers` is populated from the first cell. Actual
+        # connections happen per server, on the first mcp.call() naming it.
+        refresh_registry = None
+        if autoconnect_enabled and scopes:
+            def _discover():
+                return discover_servers(
+                    cwd=Path.cwd(), project_config_path=config_path, scopes=scopes
                 )
-                if not servers:
-                    return
+
+            async def refresh_registry():
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, _discover)
+                mcp_wrapper.set_registry(result)
+                return result
+
+            try:
+                registry = await refresh_registry()
                 logger.info(
-                    "Connecting to %d MCP servers (first mcp.* use)...", len(servers)
+                    "MCP bridge: %d servers available (%s) — connect on first use",
+                    len(registry.servers),
+                    ", ".join(registry.names) or "none",
                 )
-                results = await mcp_wrapper.connect_async(
-                    servers, timeout_s=20.0, sequential=True
-                )
-                for name, success in results.items():
-                    logger.info("  %s %s", "✓" if success else "✗", name)
+            except Exception as e:
+                logger.warning("MCP config discovery failed: %s", e)
 
         kernel = KernelSupervisor(
             mcp_wrapper=mcp_wrapper,
             workspace_root=Path.cwd(),
-            connect_servers=connect_servers,
+            refresh_registry=refresh_registry,
         )
         await kernel.start()
 
@@ -138,7 +168,8 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
         if kernel:
             await kernel.shutdown()
         if mcp_wrapper:
-            mcp_wrapper.disconnect()
+            # Async form: we are on the server's event loop here
+            await mcp_wrapper.disconnect_async()
 
     return server_lifespan
 
@@ -146,15 +177,17 @@ def create_server_lifespan(config_path: Path, autoconnect_enabled: bool, logger:
 def create_server(
     config_path: Path = Path(".mcp.json"),
     autoconnect: bool = True,
-    logger: logging.Logger = None
+    logger: logging.Logger = None,
+    scopes: tuple[str, ...] = ALL_SCOPES,
 ) -> FastMCP:
     """
     Create and configure the FastMCP server.
 
     Args:
-        config_path: Path to .mcp.json config file
-        autoconnect: Whether to auto-connect to servers
+        config_path: Path to the project's .mcp.json config file
+        autoconnect: Whether the mcp bridge is enabled
         logger: Logger instance for output
+        scopes: config scopes to discover (see mcp_config.ALL_SCOPES)
 
     Returns:
         Configured FastMCP server instance
@@ -162,7 +195,7 @@ def create_server(
     # Create lifespan
     if logger is None:
         logger = logging.getLogger(__name__)
-    lifespan = create_server_lifespan(config_path, autoconnect, logger)
+    lifespan = create_server_lifespan(config_path, autoconnect, logger, scopes)
 
     # Create server with lifespan
     mcp_server = FastMCP("python-repl", lifespan=lifespan)
@@ -194,11 +227,14 @@ def create_server(
         Helpers:
           sh   - Shell commands: json.loads(sh("gh pr view 1 --json title"))
                  Returns stdout str with .returncode/.stderr/.ok
-          mcp  - Bridge to this project's .mcp.json MCP servers:
+          mcp  - Bridge to your MCP servers across every Claude Code config
+                 scope — project (./.mcp.json), user (global), and plugins:
                  .call(server, tool, **args), .servers, .failed, .help()
-                 Connects lazily on first use. Host-level connectors
-                 (claude.ai Notion/GitHub, user-scope servers) are NOT
-                 reachable here — call their tools directly.
+                 Servers connect ON DEMAND: naming one in .call() starts it
+                 (~1-3s), later calls are warm. `.servers` lists what is
+                 available; print(mcp.help()) shows scope + status.
+                 Not reachable: claude.ai host connectors (Notion/Gmail/
+                 Drive/chrome) — call their tools directly.
 
         Missing package? Install into the running REPL env: sh('uv pip install <pkg>')
 
@@ -234,9 +270,17 @@ def main():
         help="Path to .mcp.json config file (default: .mcp.json)",
     )
     parser.add_argument(
+        "--mcp-scope",
+        default="all",
+        help=(
+            "Config scopes the mcp bridge discovers: 'all' (default), 'none', "
+            "or a comma-separated subset of local,project,user,plugin"
+        ),
+    )
+    parser.add_argument(
         "--no-autoconnect",
         action="store_true",
-        help="Disable auto-connecting to servers from .mcp.json",
+        help="Disable the mcp bridge entirely (alias for --mcp-scope none)",
     )
     parser.add_argument(
         "--debug",
@@ -249,11 +293,14 @@ def main():
     # Setup logging before server starts
     logger = setup_logging(args.debug)
 
+    scopes = parse_scopes(args.mcp_scope)
+
     # Create server with lifespan (initialization happens automatically)
     mcp_server = create_server(
         config_path=args.config,
         autoconnect=not args.no_autoconnect,
-        logger=logger
+        logger=logger,
+        scopes=scopes,
     )
 
     # Run server
