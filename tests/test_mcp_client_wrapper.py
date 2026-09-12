@@ -1,11 +1,65 @@
 """Tests for MCP client wrapper introspection features."""
 
+from contextlib import asynccontextmanager
+
 import pytest
+
+from repl_mcp import mcp_client_wrapper as wrapper_module
 from repl_mcp.mcp_client_wrapper import (
     MCPClientWrapper,
     _expand_env_value,
     _failure_reason,
 )
+from repl_mcp.models import ServerConfig
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_uses_mcp_v2_transport(monkeypatch):
+    """The v2 transport receives an httpx2 client and yields two streams."""
+    captured = {}
+    read_stream = object()
+    write_stream = object()
+
+    @asynccontextmanager
+    async def fake_transport(url, *, http_client):
+        captured["url"] = url
+        captured["authorization"] = http_client.headers["authorization"]
+        yield read_stream, write_stream
+
+    class FakeSession:
+        def __init__(self, read, write):
+            captured["streams"] = (read, write)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            captured["initialized"] = True
+
+    monkeypatch.setattr(wrapper_module, "streamable_http_client", fake_transport)
+    monkeypatch.setattr(wrapper_module, "ClientSession", FakeSession)
+
+    wrapper = MCPClientWrapper()
+    connected = await wrapper._connect_server(
+        "remote",
+        ServerConfig(
+            type="http",
+            url="https://example.test/mcp",
+            headers={"Authorization": "Bearer test"},
+        ),
+    )
+
+    assert connected is True
+    assert captured == {
+        "url": "https://example.test/mcp",
+        "authorization": "Bearer test",
+        "streams": (read_stream, write_stream),
+        "initialized": True,
+    }
+    await wrapper.disconnect_async()
 
 
 class TestMCPClientWrapperIntrospection:

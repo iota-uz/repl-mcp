@@ -40,7 +40,7 @@ To update later: `/plugin marketplace update repl-mcp` then `/plugin update pyth
 ### Claude Code (MCP server only)
 
 ```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.1 repl-mcp
+claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.2 repl-mcp
 ```
 
 Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
@@ -48,7 +48,7 @@ Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on 
 ### Codex CLI
 
 ```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.1 repl-mcp
+codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.2 repl-mcp
 ```
 
 ### Claude Desktop
@@ -60,7 +60,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "python-repl": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.1.1", "repl-mcp"]
+      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.1.2", "repl-mcp"]
     }
   }
 }
@@ -140,6 +140,13 @@ MCP client ── stdio ──► PARENT (FastMCP, pure async)        CHILD (own
 ```
 
 The server's event loop never blocks on REPL code; in-cell `mcp.*` calls are serviced on an independent channel while the cell runs. See `CLAUDE.md` for the full development guide.
+
+## v2.1.2 changes
+
+- Restores startup with MCP Python SDK v2 / FastMCP v4.
+- Migrates Streamable HTTP clients to `streamable_http_client` and `httpx2`.
+- Constrains dependency major versions so future resolver changes cannot silently
+  select an incompatible SDK generation.
 
 ## v2.1.1 changes
 

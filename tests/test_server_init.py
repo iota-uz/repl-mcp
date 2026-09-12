@@ -2,7 +2,17 @@
 
 import inspect
 from pathlib import Path
+
+from mcp.client.streamable_http import streamable_http_client
+
+from repl_mcp import mcp_client_wrapper
 from repl_mcp import repl_mcp_server
+
+
+def test_uses_current_mcp_streamable_http_transport():
+    """Import the MCP v2 transport name so dependency drift fails in CI."""
+    assert mcp_client_wrapper.streamable_http_client is streamable_http_client
+
 
 def _init_globals():
     """Initialize module globals the way the server lifespan does."""
@@ -100,8 +110,8 @@ def test_mcp_bridge_survives_a_truncated_description():
     import asyncio
 
     server = repl_mcp_server.create_server(autoconnect=False)
-    tools = asyncio.run(server.get_tools())
-    description = next(iter(tools.values())).description
+    tools = asyncio.run(server.list_tools())
+    description = tools[0].description
 
     head = description[:400]
     assert "mcp" in head, f"mcp bridge missing from the first 400 chars:\n{head}"

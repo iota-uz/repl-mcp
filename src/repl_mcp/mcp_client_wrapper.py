@@ -1,17 +1,19 @@
 """Synchronous wrapper around async MCP SDK for REPL integration."""
 
 import asyncio
+from contextlib import AsyncExitStack
 import logging
 import os
-import time
 from pathlib import Path
+import time
 from typing import Any, Optional
-from contextlib import AsyncExitStack
+
+import httpx2
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from .models import ServerConfig
 from .mcp_config import (
@@ -289,8 +291,14 @@ class MCPClientWrapper:
                 headers = dict(config.headers) if config.headers else None
 
                 if config.transport_type == "http":  # streamable HTTP
-                    read, write, _ = await exit_stack.enter_async_context(
-                        streamablehttp_client(config.url, headers=headers)
+                    http_client = await exit_stack.enter_async_context(
+                        httpx2.AsyncClient(headers=headers)
+                    )
+                    read, write = await exit_stack.enter_async_context(
+                        streamable_http_client(
+                            config.url,
+                            http_client=http_client,
+                        )
                     )
                 else:  # SSE transport
                     read, write = await exit_stack.enter_async_context(
