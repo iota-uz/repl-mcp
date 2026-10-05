@@ -10,7 +10,7 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expected-version", default="3.0.0")
+    parser.add_argument("--expected-version", default="3.0.1")
     args = parser.parse_args()
     binary = Path(sys.executable).parent / "repl-mcp"
     assert binary.is_file(), f"Installed executable missing: {binary}"
@@ -45,7 +45,10 @@ def main():
             "jsonrpc": "2.0", "method": "notifications/initialized",
         }) + "\n")
         process.stdin.flush()
-        tools = request(2, "tools/list", {})["tools"]
+        catalogue = request(2, "tools/list", {})
+        assert type(catalogue["ttlMs"]) is int and catalogue["ttlMs"] == 0, catalogue
+        assert catalogue["cacheScope"] == "private", catalogue
+        tools = catalogue["tools"]
         assert {tool["name"] for tool in tools} == {
             "execute_python", "python_start", "python_health", "python_run", "python_cancel",
         }

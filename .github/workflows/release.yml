@@ -2,7 +2,7 @@ name: Release artifacts
 
 on:
   push:
-    branches: [rust-migration]
+    branches: [rust-migration, fix-claude-catalog]
   workflow_dispatch:
     inputs:
       revision:
@@ -64,7 +64,7 @@ jobs:
         env:
           EXPECTED_WHEEL_TAG: ${{ matrix.wheel-tag }}
         run: |
-          test -f "dist/repl_mcp-3.0.0-py3-none-${EXPECTED_WHEEL_TAG}.whl"
+          test -f "dist/repl_mcp-3.0.1-py3-none-${EXPECTED_WHEEL_TAG}.whl"
           python -m venv "$RUNNER_TEMP/artifact-venv"
           "$RUNNER_TEMP/artifact-venv/bin/python" -m pip install dist/*.whl
           cd "$RUNNER_TEMP"

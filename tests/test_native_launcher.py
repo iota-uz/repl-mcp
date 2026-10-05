@@ -34,8 +34,8 @@ def test_published_wheel_launch(tmp_path, os_name, architecture, platform):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
-        "--from", f"https://github.com/iota-uz/repl-mcp/releases/download/v3.0.0/"
-        f"repl_mcp-3.0.0-py3-none-{platform}.whl",
+        "--from", f"https://github.com/iota-uz/repl-mcp/releases/download/v3.0.1/"
+        f"repl_mcp-3.0.1-py3-none-{platform}.whl",
         "repl-mcp", "--transport", "stdio", "--config", "a file.json",
     ]
     assert not result.stderr

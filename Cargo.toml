@@ -1,10 +1,13 @@
 [package]
 name = "repl-mcp"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Native MCP supervisor for a persistent Python worker"
+repository = "https://github.com/iota-uz/repl-mcp"
+homepage = "https://github.com/iota-uz/repl-mcp"
+documentation = "https://github.com/iota-uz/repl-mcp#readme"
 
 [[bin]]
 name = "repl-mcp"

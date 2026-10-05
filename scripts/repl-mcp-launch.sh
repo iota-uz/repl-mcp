@@ -1,7 +1,7 @@
 #!/bin/sh
 # Launch the published native wheel; retain the caller's working directory.
 set -eu
-version=3.0.0
+version=3.0.1
 os=$(uname -s)
 arch=$(uname -m)
 case "$os:$arch" in

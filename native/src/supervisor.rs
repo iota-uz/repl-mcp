@@ -455,7 +455,10 @@ impl Supervisor {
             if self.reserve(&id, cancel.clone(), request_cancel.clone()) {
                 break;
             }
-            let cancelling = self.active.lock().unwrap().as_ref().is_some_and(|active| {
+            // Completion clears Active before Reservation releases busy. A
+            // following request must wait for that release, just as it waits
+            // for cancellation cleanup; an ordinary active run still rejects.
+            let cancelling = self.active.lock().unwrap().as_ref().is_none_or(|active| {
                 active.cancel.is_cancelled() || active.request_cancel.is_cancelled()
             });
             if cancelling
@@ -983,6 +986,35 @@ mod tests {
         let server = supervisor();
         assert!(server.health()["python"].is_null());
         assert!(server.worker.lock().await.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn execute_waits_for_completed_run_reservation_release() {
+        let server = supervisor();
+        // Reproduce the completion window deterministically: Active is gone,
+        // but the preceding handler still owns its busy reservation.
+        server.busy.store(true, Ordering::Release);
+        let executor = server.clone();
+        let mut task = tokio::spawn(async move {
+            executor
+                .execute("42".into(), false, 5.0, CancellationToken::new())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "Next cell must wait for reservation release rather than fail busy"
+        );
+        server.busy.store(false, Ordering::Release);
+        server.available.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("Next cell must wake after reservation release")
+            .unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["value"], 42, "{result}");
         server.shutdown().await;
     }
 

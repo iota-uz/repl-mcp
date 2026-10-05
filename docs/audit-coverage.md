@@ -1,5 +1,13 @@
 # Audit #9 implementation coverage
 
+Patch 3.0.1 addresses Claude Code catalogue compatibility by adding top-level
+`ttlMs: 0` and `cacheScope: "private"` to `tools/list` responses for all supported
+protocol versions. The evidence below records the 3.0.0 migration;
+patch-specific protocol and packaging checks are recorded separately at release.
+The patch also fixes a cancellation cleanup race: execution waits within a bounded
+deadline when the old run is no longer active but still owns its cleanup slot.
+Ordinary overlap with an active run continues to fail promptly.
+
 Coverage for version 3.0.0, validated locally on macOS on 2026-10-05/06.
 Distribution checks and runtime acceptance are distinguished from live agent UI
 evaluations below. See the [release procedure](../CI.md#release-artifacts) and
