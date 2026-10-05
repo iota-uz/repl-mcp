@@ -11,9 +11,14 @@
     {
       "name": "python-repl",
       "source": "./",
-      "description": "Persistent Python REPL with sh() shell composition, full filesystem access, git/AST utilities, and MCP orchestration. Bundles the MCP server, a usage skill, and a nudge hook.",
+      "description": "Native Rust MCP with persistent Python, bounded output, observable cancellation, shell composition and an explicitly configured MCP broker. Bundles a usage skill and nudge hook.",
       "category": "development",
-      "tags": ["python", "repl", "shell", "codebase-analysis"]
+      "tags": [
+        "python",
+        "repl",
+        "shell",
+        "codebase-analysis"
+      ]
     }
   ]
 }

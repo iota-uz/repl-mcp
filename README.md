@@ -1,190 +1,229 @@
-# Stateful Python REPL MCP Server
+# REPL MCP 3.0
 
-A Model Context Protocol (MCP) server giving AI agents a **persistent Python REPL** with honest execution semantics. Code runs in a subprocess kernel (Jupyter-style): variables survive across calls, runaway code is interruptible without losing state, and crashes never take the server down. Your other MCP servers — project, global and plugin alike — are callable in-code via a pre-injected `mcp` bridge.
+A native Rust MCP server with a persistent CPython worker. Python remains the language
+of your cells; Rust owns the protocol, MCP broker, deadlines and process lifecycle.
+The worker starts on the first execution. An idle connection does not start Python
+or a multiprocessing resource tracker.
 
-## Features
-
-- **Persistent State**: variables, imports, and functions survive across calls (~0.1s warm calls vs ~3s per fresh `python3` spawn)
-- **Real Timeouts**: runaway code (sync *or* async) is interrupted at `timeout` seconds — KeyboardInterrupt, **namespace state preserved**. Cells that swallow the interrupt are killed and the kernel respawns with an explicit "variables cleared" notice
-- **Crash Isolation**: a segfault/OOM in REPL code kills only the kernel child; the server respawns it instantly
-- **Top-level `await`**: `await client.get(url)` directly — no `asyncio.run()` wrapper
-- **Shell Composition**: pre-injected `sh()` helper — `json.loads(sh("gh pr view 1 --json title"))` replaces `cmd | python3 -c` pipelines
-- **Full Filesystem Access**: `open()`, absolute paths, and `~` all work; cwd is your project
-- **MCP Bridge**: `mcp.call("server", "tool", **args)` reaches every MCP server Claude Code knows — project (`./.mcp.json`), **user/global** (`~/.claude.json`) and plugin-provided — each connected **on demand**, the first time you name it. Failures stay visible in `mcp.failed` / `mcp.help()`
-- **Claude Code Plugin**: one install bundles the server, a usage skill, and a Bash-nudge hook
+Execution has full access to the host filesystem, environment and network. The user
+explicitly chose this mode; the process boundary provides crash recovery, not a sandbox.
+Supported hosts: macOS and Linux. Windows job ownership is not implemented.
 
 ## Installation
 
-### Claude Code (plugin — recommended)
+Download the wheel matching your host from the [v3.0.0 GitHub release](https://github.com/iota-uz/repl-mcp/releases/tag/v3.0.0):
+macOS arm64, macOS x86_64 or Linux x86_64 (glibc 2.28+). Python 3.10+ is required;
+binary wheels do not require a Rust compiler. Install the downloaded wheel in a
+dedicated environment:
 
-```bash
-# In Claude Code:
-/plugin marketplace add iota-uz/repl-mcp
-/plugin install python-repl@repl-mcp
+```sh
+uv venv ~/.local/share/repl-mcp/venv --python 3.12
+uv pip install --python ~/.local/share/repl-mcp/venv/bin/python /absolute/path/repl_mcp-3.0.0-*.whl
+~/.local/share/repl-mcp/venv/bin/repl-mcp --help
 ```
 
-Restart the session and all three components are active. Portable across machines — nothing is hand-edited in `~/.claude.json`.
+Use that absolute executable path in your client registration. Releases are
+distributed through GitHub; an unqualified PyPI install is not the release path.
+Source installation requires Rust 1.88+ and CPython 3.10+:
 
-> **Migrating from a `claude mcp add` install?** Remove the old entry first: `claude mcp remove python-repl -s user`. Keeping both registers two REPL server processes with duplicate tools and can skew versions between them.
+```sh
+uv sync --extra dev --locked
+uv run repl-mcp --help
+uv run repl-mcp --transport stdio --mcp-scope none
+```
 
-**What the plugin bundles:**
+For a client launch configuration, use the absolute installed `repl-mcp` executable
+and an explicit project/config directory. The default working directory is the
+client's launch directory. `--python /absolute/venv/bin/python` selects a runtime;
+otherwise the binary prefers a sibling Python interpreter, then `python3` on PATH.
+This makes wheel/uvx installations use their own environment. `python_health`
+reports the selected interpreter and, after lazy startup, its actual version.
 
-| Component | What it does |
+The plugin launcher selects the published wheel for the host and runs it through
+`uvx`; its default launch does not compile Rust. It requires `uv` on PATH. The first
+launch downloads the wheel and Python dependencies, so allow enough startup time
+for that initial network setup. Subsequent launches reuse uv's cache. For a client
+with a short startup deadline, prewarm it with
+`sh /path/to/plugin/scripts/repl-mcp-launch.sh --help`, or register the installed
+binary above. Deliberate Git/source launches require Rust and a longer cold-start
+budget for compilation.
+Do not leave old MCP registrations enabled alongside the native server. The Python
+2.x server and engine modules remain source regression fixtures, not the shipped
+entrypoint; the binary wheel contains the Rust executable with an embedded worker.
+For changes to broker discovery, result envelopes and helper APIs, follow the
+[3.0 migration checklist](CHANGELOG.md#migration-from-2x).
+
+## Execution tools
+
+| Tool | Purpose |
 |---|---|
-| **MCP server** | `execute_python` tool, launched via `uvx` pinned to the release tag (cached after first run; the REPL's working directory is your project, not the plugin cache) |
-| **Skill** (`python-repl`) | Teaches Claude when to reach for the REPL (instead of `python3 -c` / heredocs via Bash) and its gotchas — truncation limits, the on-demand mcp bridge, package installs |
-| **Nudge hook** (PostToolUse) | When Claude runs inline Python through Bash (`python3 -c`, `python3 - <<EOF`, `cmd \| python3`), injects a non-blocking reminder to use `execute_python`. Silent on `python3 script.py`, `python3 -m ...`, `pytest` |
+| `execute_python(code, reset=False, timeout=120, session_id=None)` | Execute one cell; top-level await works; state persists |
+| `python_start(code, reset=False, timeout=120, session_id=None)` | Start a long cell and return its run ID immediately |
+| `python_health()` | Inspect server/runtime/broker without starting Python or connecting servers |
+| `python_run(run_id=None)` | Inspect active execution or the latest retained result |
+| `python_cancel(run_id=None)` | Request cancellation of the active execution and linked MCP calls |
 
-To update later: `/plugin marketplace update repl-mcp` then `/plugin update python-repl@repl-mcp`.
+Results contain readable text and structured fields: `run_id`, `success`, `stdout`,
+`stderr`, `return_value`, `error`, `elapsed_ms`, `truncated` and `state`. Results also
+identify the session and generation. `state` describes the worker after execution;
+`state_reset` reports a fresh/reset/recovered namespace before that cell. Python failures
+set MCP `isError`; invalid tool arguments are protocol errors. Timing includes
+postprocessing. Normal interruption preserves variables; crashes or forced termination
+clear them. A reset restarts the worker and restores initial cwd/environment/loop.
 
-### Claude Code (MCP server only)
+Only one cell runs at a time; overlapping executions fail promptly. Health and cancel
+remain available. For current MCP 2026-07-28 stateless requests, first call health,
+then pass its `server.session_id` to execution/start; a foreign session ID is rejected.
+Legacy clients can omit it. `python_start` avoids client request deadlines: poll
+`python_run(run_id)` until completion, or cancel it explicitly. History retains the
+last 64 results. Output is bounded during writes
+in UTF-8 bytes, not after accumulating an unlimited buffer. Safe previews inspect
+small builtin values; custom `repr` is not executed implicitly. Native fd output is
+drained separately and never mixed into MCP stdout.
 
-```bash
-claude mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.2 repl-mcp
+```python
+import asyncio
+import httpx
+client = httpx.AsyncClient()
+# A later cell can reuse the client on the persistent loop:
+data = (await client.get(url)).json()
 ```
 
-Pin to a tag (as above) so `uvx` caches the build instead of fetching GitHub on every session start.
+Cell-owned background tasks and delayed callbacks are cancelled at completion.
+Unjoined user threads or still-running executor work require termination of the
+worker and report cleared state; finished/default DNS executor threads may remain
+idle. Keep resource objects and await their work. Use top-level await instead of
+nested `asyncio.run()`.
 
-### Codex CLI
-
-```bash
-codex mcp add python-repl -- uvx --from git+https://github.com/iota-uz/repl-mcp@v2.1.2 repl-mcp
+```python
+from pathlib import Path
+Path('~/data.json').expanduser().read_text()  # open() does not expand ~
+json_text = sh('gh pr list --json number,title')
+print(json_text.returncode, json_text.stderr, json_text.ok)
 ```
 
-### Claude Desktop
+`sh()` captures bounded stdout/stderr, follows Python's current cwd, and owns its
+process group. Standard `subprocess.Popen` children are tracked and polled to avoid
+retained zombies while preserving `.wait()` results. Explicit process detachment,
+`os.fork`, native process APIs and arbitrary custom signal handling are trusted code;
+they are not an OS containment guarantee.
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+`checkpoint(path)` writes a bounded, atomic JSON checkpoint of supported builtin
+namespace values and reports skipped values. `restore(path)` validates the complete
+checkpoint before loading it. Imports, functions, native objects and active resources
+are not serializable through this contract. No automatic code replay or pickle loading.
+`repl_history()` lists source IDs/line counts; `repl_source(run_id)` explicitly retrieves
+retained code. Source/linecache storage is capped at 64 runs and 1 MiB, never journalled.
+
+## MCP broker
+
+The default registry is the launch project's `.mcp.json`. Use `--config /path/registry.json`
+for an independent broker registry, or `--mcp-scope none` to disable it. Client-managed
+cloud connectors cannot be discovered by a local server. Claude, Codex and t3 can all
+use the same explicit registry; another client's credentials and approvals are not
+inherited automatically.
 
 ```json
 {
   "mcpServers": {
-    "python-repl": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/iota-uz/repl-mcp@v2.1.2", "repl-mcp"]
+    "service": {
+      "type": "stdio",
+      "command": "/absolute/path/service-mcp",
+      "args": [],
+      "allowedTools": ["read_record", "update_record"]
     }
   }
 }
 ```
 
-### Manual (development)
-
-```bash
-git clone https://github.com/iota-uz/repl-mcp && cd repl-mcp
-uv sync --extra dev
-uv run repl-mcp                  # stdio transport (the only transport)
-```
-
-## Usage
-
-One tool: `execute_python(code, reset=False, timeout=120)`.
+A dedicated registry is a grant to the broker. `allowedTools` narrows that grant and
+is checked on each call. Foreign Claude `user`/`local` scopes are opt-in and require
+independent `brokerAllowed: true` entries; plugin registries require an explicit
+exported configuration. This avoids reinterpreting a client's interactive approvals
+as blanket authorization. `REPL_MCP_NO_BRIDGE=1` blocks recursive brokers.
 
 ```python
-# State persists across calls
-execute_python(code="import httpx; data = (await httpx.AsyncClient().get(url)).json()")
-execute_python(code="len(data['items'])")          # → 42
-
-# Shell composition
-execute_python(code="prs = json.loads(sh('gh pr list --json number,title'))")
-
-# MCP bridge — see what's reachable (free, connects nothing)
-execute_python(code="print(mcp.help())")
-# Any scope: project, user/global, plugin. The named server starts on first call.
-execute_python(code="mcp.call('github', 'create_issue', owner='me', repo='proj', title='Bug')")
-execute_python(code="for f in files: mcp.call('telegram-mcp', 'download_media', **f)")
-
-# Runaway code? Interrupted at timeout, state survives:
-execute_python(code="while True: pass", timeout=5)
-# → KeyboardInterrupt: execution interrupted. Namespace state ... preserved.
-
-# Missing package? Install into the running env:
-execute_python(code="sh('uv pip install openpyxl')")
+print(mcp.help())                         # names only, connects nothing
+print(mcp.help('service', 'read_record'))  # full input/output schema
+response = mcp.call('service', 'read_record', arguments={'id': '123'})
+print(response.get('structuredContent'))  # complete envelope retained
+print(mcp.text(response))                 # all text blocks, explicit extraction
+response = await mcp.acall('service', 'read_record', arguments={'id': '456'})
 ```
 
-Notes:
-- The `mcp` bridge sees claude.ai host connectors (Notion/Gmail/Drive/chrome) **not at all** — those are server-managed with nothing on disk, so call their tools directly. Everything configured locally is reachable; see Scopes below.
-- `mcp.call` arguments must be JSON-serializable (they cross the kernel process boundary).
-- Output truncates at 50KB (stdout) / 20KB (return values) — aggregate in-REPL.
-- `reset=True` clears variables but keeps `sh`/`mcp`.
+`mcp.call` is synchronous; `mcp.acall` supports concurrent async work. Legacy
+`await mcp.call(...)` succeeds after a single synchronous call, so it cannot fail
+only after applying a write. Use `arguments={...}` for tool arguments named `timeout`,
+`server`, `tool` or `arguments`. MCP errors raise `ToolError` with `.result` retaining
+the full envelope. Listing follows bounded pagination; failures are not empty success.
 
-## MCP bridge scopes
+Sessions connect lazily, equivalent aliases share a transport, and broken transports
+are invalidated. Refresh does not retry writes. `mcp.refresh()` reloads configuration;
+`mcp.journal()` shows bounded call metadata and outcomes, including `outcome_unknown`
+when a dispatched call is abandoned. No arguments or response payloads enter this
+journal. `--journal /private/path/journal.json` optionally persists those metadata
+records atomically with an exclusive process lock. Prior unfinished dispatches become
+`outcome_unknown` on recovery. An execution is not a transaction: cancellation cannot undo a committed write.
+Reconcile an unknown outcome with the target before retrying.
 
-Discovery mirrors Claude Code's own config layout. On a name collision the highest-precedence
-scope wins; the loser stays reachable as `project:name` / `user:name` / `plugin:id:name`.
+Configuration errors omit secret values. `${VAR}` must exist and be nonempty;
+transport mismatches, unknown fields and empty Bearer headers fail explicitly.
+HTTP uses Streamable HTTP, with explicit headers or independently configured OAuth.
+`--oauth-login SERVER` starts the configured broker's authorization flow; it does
+not borrow browser credentials from another client. Invalid broker configuration
+leaves health and ordinary Python available; broker operations fail closed until a
+successful refresh. See the configuration contract
+in [migration design](docs/rust-migration.md).
 
-| Precedence | Scope | Source |
-|---|---|---|
-| 1 | local | `~/.claude.json` → `projects["<cwd>"].mcpServers` |
-| 2 | project | `<cwd>/.mcp.json` → `mcpServers` (or `--config`) |
-| 3 | user (global) | `~/.claude.json` → `mcpServers` |
-| 4 | plugin | each enabled plugin's `.claude-plugin/plugin.json` → `mcpServers` |
+For an independent authorization-code grant:
 
-Servers listed in `disabledMcpjsonServers` are skipped. This REPL server itself is always excluded,
-so `mcp.call` can never fork a nested bridge.
-
-Discovery runs at startup and spawns nothing — a server process starts only when you name it in
-`mcp.call()` (~1-3s the first time, warm after). `print(mcp.help())` shows every available server
-with its scope and status without connecting anything.
-
-**Security**: in-REPL code can now start any of your configured MCP servers with your credentials.
-Narrow it with `--mcp-scope project,local` (or `--mcp-scope none` to disable the bridge entirely).
-
-## Architecture (v2: subprocess kernel)
-
-```
-MCP client ── stdio ──► PARENT (FastMCP, pure async)        CHILD (owns namespace)
-                          execute_python ── EXECUTE ──────►  exec / await cell
-                                       ◄──── RESULT ──────   captured output
-                          timeout: SIGINT ────────────────►  KeyboardInterrupt
-                          crash: respawn + clear notice      (state survives)
-                     MCP sessions (on demand)  ◄─ MCP_CALL ─ in-code mcp.* proxy
+```json
+{"mcpServers":{"service":{"type":"http","url":"https://service.example/mcp",
+  "oauth":{"grantType":"authorization_code",
+    "credentialFile":"/private/directory/service.json","redirectPort":0}}}}
 ```
 
-The server's event loop never blocks on REPL code; in-cell `mcp.*` calls are serviced on an independent channel while the cell runs. See `CLAUDE.md` for the full development guide.
+Run `repl-mcp --config /absolute/registry.json --oauth-login service`, then open
+the printed authorization URL. Credential directories/files require private
+permissions; symlinks are rejected. `redirectPort: 0` uses an ephemeral localhost
+port; configure a fixed port when the provider requires a pre-registered callback.
+Client-credentials grants use `grantType: "client_credentials"`, `clientId` and
+`clientSecret`; environment substitutions keep secrets out of checked-in config.
 
-## v2.1.2 changes
+## Packages and resource limits
 
-- Restores startup with MCP Python SDK v2 / FastMCP v4.
-- Migrates Streamable HTTP clients to `streamable_http_client` and `httpx2`.
-- Constrains dependency major versions so future resolver changes cannot silently
-  select an incompatible SDK generation.
+Runtime dependencies are pinned; Rust's transitive graph is committed in `Cargo.lock`,
+and Python's environment in `uv.lock`. To add a package to the actual running
+interpreter, use an explicit target:
 
-## v2.1.1 changes
-
-Discoverability fixes — v2.1.0 made global servers reachable, but an agent still had to *know* that:
-
-- The `mcp` bridge is named in the **first paragraph** of the `execute_python` description. Clients
-  that defer tools show agents a truncated description; everything from `Helpers:` down was being cut,
-  so the bridge was invisible exactly when it mattered
-- `repr(mcp)` now names the reachable servers instead of just listing its own methods
-- `mcp.servers` renders as `<available: [...] | live: [...]>` — a bare list read as "these are running"
-
-## v2.1.0 changes
-
-- **Global MCP servers are reachable**: the bridge merges user-scope (`~/.claude.json`), local, project
-  and plugin configs instead of only `./.mcp.json`
-- **On-demand connect**: naming a server starts that one server; a session that never touches `mcp.*`
-  still spawns zero child processes. Failed connects are remembered briefly so a loop over a dead
-  server doesn't pay the timeout each iteration
-- **`mcp.servers` now lists what is *available*** (any scope), not just what happens to be connected
-- `${VAR}` expansion applies to `command`/`args`/`url` too; unset vars fail the connect with a clear
-  reason instead of exec'ing an empty command
-- New `--mcp-scope` flag (`all` by default)
-
-## v2.0.0 breaking changes
-
-- **Removed** (zero observed usage across real agent transcripts): `workspace`/`git`/`ast_utils`/`code` pre-injected utilities (use `open()`/`pathlib`/`sh('git …')`), `%magic` commands and `object?` queries, the `inject` parameter, `mcp.tools.<server>.<tool>` dot-style access and `discover_tools()` (use `mcp.call`/`mcp.list_tools`), SSE transport (stdio only)
-- **Changed**: execution moved to a subprocess kernel — `timeout` is now actually enforced; kernel restarts are reported explicitly
-- **Added**: top-level `await`, `mcp.failed`, lazy MCP connect
-- Install footprint dropped ~350MB (tree-sitter removed)
-
-## Development
-
-```bash
-uv run pytest tests/ -v          # full suite
+```python
+import shlex, sys
+sh('uv pip install --python ' + shlex.quote(sys.executable) + ' numpy==2.2.6')
 ```
 
-See `CLAUDE.md` for architecture details, test map, gotchas, and the release process.
+Imports may need a worker reset after an install. Prefer a reproducible configured
+venv for long-lived use. `openpyxl` and `httpx` are included; scientific packages
+are not silently installed.
 
-## License
+Limits include 256 KiB code, 1 MiB protocol/worker frames, 50,000-byte captured streams,
+20,000-byte previews, bounded RPC concurrency and execution timeout up to 3600 seconds.
+`--max-memory-mib` defaults to 2048; zero disables RSS enforcement. This sampled
+worker RSS budget is not a hard whole-tree quota. A native C call may not process
+SIGINT; after the grace period Rust terminates the worker and reports cleared state.
+Large output should be written to an explicitly chosen file and summarized in the cell.
 
-MIT
+## Verification
+
+```sh
+make verify
+make wheel
+make sdist
+```
+
+CI runs strict Rust/Python checks and the complete regression suite on macOS/Linux,
+Python 3.10/3.12/3.14 and MCP SDK 2.2/2.3. Stdio contract tests cover errors, schemas,
+cancellation late effects, fatal exits, asynchronous state and full broker envelopes.
+These fixtures verify wire behavior; they do not claim a live Claude/Codex/t3 UI test.
+See [audit coverage](docs/audit-coverage.md) for per-finding evidence and residual limits.
+
+[MIT license](LICENSE).

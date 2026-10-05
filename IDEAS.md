@@ -1,5 +1,8 @@
 # REPL MCP Enhancement Ideas
 
+Historical brainstorming for Python 2.x; unchecked ideas below are not the 3.x
+implementation contract. Current decisions are in [migration design](docs/rust-migration.md).
+
 This document captures brainstorming ideas for enhancing the Python REPL MCP. These range from practical to experimental. The goal is to give LLMs programmatic superpowers when working with codebases and external tools.
 
 ---

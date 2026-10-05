@@ -28,7 +28,6 @@ env/
 
 # UV
 .uv/
-uv.lock
 
 # IDE
 .vscode/
@@ -47,3 +46,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust artifacts (Cargo.lock is committed)
+target/
+.ruff_cache/

@@ -1,13 +1,5 @@
 {
   "mcpServers": {
-    "github": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "${GH_TOKEN}"
-      }
-    },
     "python-repl": {
       "type": "stdio",
       "command": "uv",
@@ -15,7 +7,9 @@
         "run",
         "repl-mcp",
         "--transport",
-        "stdio"
+        "stdio",
+        "--mcp-scope",
+        "none"
       ]
     }
   }

@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 import pytest
@@ -13,12 +14,20 @@ from mcp.client.stdio import stdio_client
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def native_binary():
+    """Use the native runtime built by CI; never resolve an unrelated cached release."""
+    binary = Path(os.environ.get("REPL_MCP_BINARY", PROJECT_ROOT / "target/debug/repl-mcp"))
+    if not binary.is_file():
+        pytest.skip("Build native runtime or set REPL_MCP_BINARY")
+    return str(binary.resolve())
+
+
 class TestClaudeCodeIntegration:
     """Test server startup as Claude Code would launch it."""
 
     @pytest.mark.asyncio
     async def test_full_mcp_json_flow(self, clean_environment):
-        """Test complete flow using exact dev MCP configuration."""
+        """Test the configured stdio flow against the locally built native runtime."""
         # Load actual config (.mcp.dev.json — renamed from .mcp.json so it
         # isn't auto-discovered as the plugin's MCP bundle)
         config_path = PROJECT_ROOT / ".mcp.dev.json"
@@ -33,8 +42,8 @@ class TestClaudeCodeIntegration:
 
         # Claude Code launches stdio servers: spawn and connect over stdio.
         server_params = StdioServerParameters(
-            command=python_repl["command"],
-            args=python_repl.get("args", []),
+            command=native_binary(),
+            args=["--python", sys.executable, "--transport", "stdio", "--mcp-scope", "none"],
             env=None,
             cwd=PROJECT_ROOT,
         )
@@ -47,9 +56,12 @@ class TestClaudeCodeIntegration:
                 tool_names = [t.name for t in tools.tools]
                 assert "execute_python" in tool_names
 
+                health = await session.call_tool("python_health", arguments={})
+                session_id = health.structured_content["server"]["session_id"]
+
                 result = await session.call_tool(
                     "execute_python",
-                    arguments={"code": "import sys; sys.version"},
+                    arguments={"code": "import sys; sys.version", "session_id": session_id},
                 )
                 # Plain text output includes version string with "→" prefix
                 output = str(result.content)
@@ -57,8 +69,8 @@ class TestClaudeCodeIntegration:
 
     @pytest.mark.asyncio
     async def test_stdio_autoconnect_does_not_pollute_stdout(self, tmp_path, clean_environment):
-        """Test that autoconnect doesn't corrupt stdio JSON-RPC stream."""
-        # Create a config with an intentionally failing server to exercise autoconnect paths.
+        """Invalid broker configuration leaves stdio and ordinary Python usable."""
+        # An unsupported field must be diagnosed without corrupting MCP stdout.
         (tmp_path / ".mcp.json").write_text(
             json.dumps(
                 {
@@ -75,8 +87,8 @@ class TestClaudeCodeIntegration:
         )
 
         server_params = StdioServerParameters(
-            command="uv",
-            args=["run", "repl-mcp", "--transport", "stdio"],
+            command=native_binary(),
+            args=["--python", sys.executable, "--transport", "stdio"],
             env=None,
             cwd=tmp_path,
         )
@@ -90,8 +102,11 @@ class TestClaudeCodeIntegration:
                 tool_names = [t.name for t in tools.tools]
                 assert "execute_python" in tool_names
 
+                health = await session.call_tool("python_health", arguments={})
+                session_id = health.structured_content["server"]["session_id"]
+
                 result = await session.call_tool(
                     "execute_python",
-                    arguments={"code": "2+2"},
+                    arguments={"code": "2+2", "session_id": session_id},
                 )
                 assert "4" in str(result.content)
