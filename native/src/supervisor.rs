@@ -933,6 +933,46 @@ mod tests {
         ))
     }
 
+    async fn executing_worker(server: &Supervisor, id: Option<&str>, output: &str) -> i32 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let progress = server.run(id);
+                let pid = server
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|runtime| runtime["pid"].as_u64());
+                if progress["stdout"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(output))
+                    && let Some(pid) = pid
+                {
+                    return i32::try_from(pid).expect("Worker PID must fit pid_t");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Cell never emitted {output:?} with a ready worker within10s: progress={}, health={}",
+                server.run(id),
+                server.health()
+            )
+        })
+    }
+
+    async fn worker_reaped(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Worker {pid} should be dead and reaped within10s"));
+    }
+
     #[test]
     fn native_rss_monitor_reports_real_memory() {
         assert!(worker_rss(std::process::id()).unwrap() > 0);
@@ -1020,30 +1060,18 @@ mod tests {
         let task = tokio::spawn(async move {
             executor
                 .execute(
-                    "import time; time.sleep(20); late_effect=True".into(),
+                    "import time; print('started', flush=True); time.sleep(20); late_effect=True"
+                        .into(),
                     false,
                     30.0,
                     CancellationToken::new(),
                 )
                 .await
         });
-        for _ in 0..100 {
-            if server.run(None)["status"] == "running" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = server.runtime.lock().unwrap().as_ref().unwrap()["pid"]
-            .as_u64()
-            .unwrap() as i32;
+        let pid = executing_worker(&server, None, "started\n").await;
         task.abort();
         let _ = task.await;
-        for _ in 0..100 {
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        worker_reaped(pid).await;
         assert_ne!(
             unsafe { libc::kill(pid, 0) },
             0,
@@ -1087,31 +1115,26 @@ mod tests {
     async fn background_start_polls_live_output_cancels_and_owns_shutdown() {
         let server = supervisor();
         let started = server.start(
-            "import time; print('live'); time.sleep(20); late_effect=True".into(),
+            "import time; print('live', flush=True); time.sleep(20); late_effect=True".into(),
             false,
             30.0,
         );
         let id = started["run_id"].as_str().unwrap();
         assert!(server.start("1".into(), false, 5.0).get("error").is_some());
-        let mut visible = false;
-        for _ in 0..100 {
-            if server.run(Some(id))["stdout"] == "live\n" {
-                visible = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            visible,
-            "Live output should be observable while the owned task executes"
-        );
+        executing_worker(&server, Some(id), "live\n").await;
         assert_eq!(server.cancel(Some(id))["cancel_requested"], true);
-        for _ in 0..100 {
-            if server.run(Some(id)).get("success").is_some() {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.run(Some(id)).get("success").is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Cancelled run never completed within10s: {}",
+                server.run(Some(id))
+            )
+        });
         assert_eq!(server.run(Some(id))["success"], false);
         let result = server
             .execute(
@@ -1122,9 +1145,17 @@ mod tests {
             )
             .await;
         assert_eq!(result["value"], false);
-        let next = server.start("import time; time.sleep(20)".into(), false, 30.0);
+        let next = server.start(
+            "import time; print('shutdown-ready', flush=True); time.sleep(20)".into(),
+            false,
+            30.0,
+        );
         assert!(next["run_id"].is_string());
-        server.shutdown().await;
+        let pid = executing_worker(&server, next["run_id"].as_str(), "shutdown-ready\n").await;
+        tokio::time::timeout(Duration::from_secs(10), server.shutdown())
+            .await
+            .expect("Owned background task shutdown must complete within10s");
+        worker_reaped(pid).await;
         assert!(!server.busy.load(Ordering::Acquire));
         assert!(server.worker.lock().await.is_none());
     }

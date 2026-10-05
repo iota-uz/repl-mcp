@@ -8,11 +8,16 @@ native acceptance tests, then runs Rust tests and the complete Python suite.
 Set `CARGO_TARGET_DIR` to keep build artifacts outside the checkout if desired.
 Use `make wheel` and `make sdist` for distribution checks.
 
-The GitHub Actions matrix covers macOS/Linux, Python 3.10/3.12/3.14 and MCP SDK
+The GitHub Actions matrix uses explicit `macos-15`/`ubuntu-24.04` images and covers
+Python 3.10/3.12/3.14 and MCP SDK
 2.2/2.3. The development extra pins SDK 2.2; the matrix deliberately installs its
 selected SDK afterwards. Protocol fixtures test both legacy and current MCP.
 A separate job builds and installs the source distribution. Jobs also install
 the binary wheel and check the installed executable.
+Both workflows have read-only repository permissions. Regression output names
+each test and dumps thread stacks after 60 seconds of a stalled test. Cancellation
+tests synchronize on actual worker output and readiness rather than a fixed
+startup delay.
 
 Acceptance tests use real stdio processes and local HTTP/OAuth fixtures. They
 check full schemas/results, cancellation and late effects, parent death during

@@ -7,13 +7,16 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-15]
         python-version: ["3.10", "3.12", "3.14"]
         mcp-version: ["2.2.0", "2.3.0"]
     steps:
@@ -43,13 +46,13 @@ jobs:
         env:
           REPL_MCP_BINARY: ${{ github.workspace }}/target/debug/repl-mcp
           PYTHONPATH: src
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -v -o faulthandler_timeout=60
         timeout-minutes: 15
       - name: Installed CLI smoke test
         run: repl-mcp --help
 
   source-package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

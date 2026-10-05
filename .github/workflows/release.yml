@@ -34,7 +34,7 @@ jobs:
             wheel-tag: macosx_11_0_x86_64
             manylinux: auto
           - platform: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             wheel-tag: manylinux_2_28_x86_64
             manylinux: '2_28'
@@ -78,7 +78,7 @@ jobs:
 
   sdist:
     name: Source archive
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
