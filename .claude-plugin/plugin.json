@@ -1,8 +1,8 @@
 {
   "name": "python-repl",
   "displayName": "Python REPL",
-  "version": "2.1.2",
-  "description": "Persistent Python REPL MCP server \u2014 use instead of python3 -c via Bash. Subprocess kernel with real timeouts (interrupt preserves state) and crash isolation, top-level await, sh() shell composition, full filesystem access, and an on-demand MCP bridge reaching your project, global and plugin servers.",
+  "version": "3.0.0",
+  "description": "Native Rust MCP server with a persistent Python worker, bounded output, cancellation and crash recovery. Full filesystem access, top-level await, sh() and an explicitly configured MCP bridge.",
   "author": {
     "name": "iota-uz",
     "url": "https://github.com/iota-uz"
@@ -19,11 +19,11 @@
   "mcpServers": {
     "python-repl": {
       "type": "stdio",
-      "command": "uvx",
+      "command": "sh",
       "args": [
-        "--from",
-        "git+https://github.com/iota-uz/repl-mcp@v2.1.2",
-        "repl-mcp",
+        "-c",
+        "#!/bin/sh\n# Launch the published native wheel; retain the caller's working directory.\nset -eu\nversion=3.0.0\nos=$(uname -s)\narch=$(uname -m)\ncase \"$os:$arch\" in\n  Darwin:arm64) platform=macosx_11_0_arm64 ;;\n  Darwin:x86_64) platform=macosx_11_0_x86_64 ;;\n  Linux:x86_64) platform=manylinux_2_28_x86_64 ;;\n  *)\n    printf 'repl-mcp: unsupported host %s/%s; use macOS arm64/x86_64 or Linux x86_64 (glibc 2.28+).\\n' \"$os\" \"$arch\" >&2\n    exit 1\n    ;;\nesac\nif ! command -v uvx >/dev/null 2>&1; then\n  printf 'repl-mcp: uvx is required; install uv from https://docs.astral.sh/uv/getting-started/installation/ or register an installed repl-mcp executable.\\n' >&2\n  exit 1\nfi\nwheel=\"https://github.com/iota-uz/repl-mcp/releases/download/v${version}/repl_mcp-${version}-py3-none-${platform}.whl\"\nexec uvx --from \"$wheel\" repl-mcp \"$@\"\n",
+        "repl-mcp-plugin",
         "--transport",
         "stdio"
       ]

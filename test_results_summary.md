@@ -1,4 +1,8 @@
-# Python REPL MCP Server - Test Results Summary
+# Historical Python 2.x test results
+
+This archived report describes the previous implementation. It is not acceptance
+evidence for the Rust 3.x runtime. See [current verification](CI.md) and
+[audit coverage](docs/audit-coverage.md).
 
 ## Test Suite Results
 

@@ -1,0 +1,28 @@
+[package]
+name = "repl-mcp"
+version = "3.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Native MCP supervisor for a persistent Python worker"
+
+[[bin]]
+name = "repl-mcp"
+path = "native/src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+libc = "0.2"
+jsonschema = { version = "0.33", default-features = false }
+process-wrap = { version = "10", features = ["tokio1", "process-group"] }
+rmcp = { version = "=3.5.0", features = ["auth", "server", "client", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sse-stream = "0.2.4"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+uuid = { version = "1", features = ["v4"] }

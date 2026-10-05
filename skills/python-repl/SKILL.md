@@ -1,76 +1,100 @@
 ---
 name: python-repl
-description: Use INSTEAD of running `python3 -c`, a `python3 - <<EOF` heredoc, or a `cmd | python3` pipeline via Bash — and for batch file operations, data aggregation, multi-step analysis where steps depend on each other, or orchestrating MCP tools (project *or* global) in one script instead of many individual tool calls. Guides effective use of the Python REPL MCP server (`execute_python`).
+description: Use the native REPL MCP for persistent Python, batch file analysis, shell composition and calls to explicitly configured MCP servers. Prefer it to inline Python shell commands for multi-step work.
 ---
 
-# Python REPL MCP — When and How
+# Python REPL MCP 3.x
 
-## Loading the tool
+Load `execute_python` through tool search when deferred. Use `python_health` to
+verify server version, selected Python interpreter, limits and broker configuration.
+For a long cell use `python_start` to obtain a run ID immediately, then poll or cancel.
+For MCP 2026-07-28, take `session_id` from health and pass it to execution; legacy
+clients can omit it. One cell runs at a time. `python_run` polls progress/result and
+`python_cancel` cancels an active run independently of Python execution.
 
-`execute_python` is an MCP tool and may be deferred (name visible, schema not loaded). Load it once, then it stays available for the whole session:
+## Python and files
 
-```
-ToolSearch query: "execute_python"
-```
-
-(The exact tool name depends on install method: `mcp__plugin_python-repl_python-repl__execute_python` via the plugin, `mcp__python-repl__execute_python` via `claude mcp add` — keyword search matches both.)
-
-## Why over Bash python
-
-- **Warm and persistent**: ~0.1s per call vs ~3s per fresh `python3` spawn. Variables, imports, and functions survive across calls — build analysis incrementally instead of re-parsing in every command.
-- **Honest timeouts**: runaway code is interrupted at `timeout` seconds (KeyboardInterrupt) and your variables survive the interrupt. A crash (segfault/OOM) only restarts the REPL kernel — you get a clear "variables cleared" notice, never a hung server.
-- **Top-level `await` works**: `await client.get(url)` directly, no `asyncio.run()` wrapper.
-- **Shell composition built in**: `sh()` replaces `cmd | python3 -c` pipelines (below).
-
-## Shell composition with sh()
-
-`sh(cmd)` runs a shell command and returns stdout as a `str` subclass — usable directly:
+Variables and imports persist. Top-level `await` uses a persistent event loop;
+resource objects can be reused across cells. Do not wrap cells in `asyncio.run()`.
+Cell-created tasks and delayed callbacks are cancelled when the cell finishes.
+Unjoined user threads or active executor work force a reported worker reset; idle
+DNS/default executor threads are safe to keep. Code has full
+host filesystem/environment/network access; there is no sandbox.
 
 ```python
-data = json.loads(sh("gh pr view 2822 --json statusCheckRollup"))
-files = sh("git ls-files '*.py'").splitlines()
-
-r = sh("pytest -q", check=False)   # check=False: don't raise on nonzero exit
-if not r.ok:
-    print(r.returncode, r.stderr[-500:])
+import json
+from pathlib import Path
+rows = json.loads(Path('~/data.json').expanduser().read_text())
+print(len(rows))
 ```
 
-Pipes, globs, and `&&` all work (`shell=True`). On nonzero exit it raises `ShellError` (carrying `.returncode`/`.stdout`/`.stderr`) unless `check=False`.
+`open()` and `Path()` do not expand `~` automatically. Relative paths follow the
+worker's current cwd. `reset=True` restarts the worker: variables, imports, cwd,
+environment changes and async resources are cleared. Ordinary interruption preserves
+state; hard termination/crash clears it and reports that change. Use an explicit
+`checkpoint(path)` / `restore(path)` for supported JSON values, not functions,
+imports or live resources. `repl_history()` lists source IDs/line counts;
+`repl_source(run_id)` retrieves bounded source explicitly. Check checkpoint's skipped list before relying on it.
 
-## File access
+## Shell composition
 
-Full filesystem access. `open()`, `Path().read_text()`, absolute paths, and `~` all work. Relative paths resolve against the project directory.
+```python
+r = sh('gh pr list --json number,title', check=False)
+if r.ok:
+    prs = json.loads(r)
+else:
+    print(r.returncode, r.stderr)
+```
+
+`sh` returns a string with `.returncode`, `.stderr`, `.ok` and `.truncated`. It follows
+Python cwd and has bounded capture and process-group cleanup. Standard Popen children
+are tracked/reaped; intentional detachment and custom native process APIs remain
+trusted code responsibilities.
 
 ## MCP bridge
 
-`mcp` reaches every MCP server Claude Code has configured — project (`./.mcp.json`), **user/global** (`~/.claude.json`, i.e. `claude mcp add -s user`), and plugin-provided. Each server starts the first time you name it (a few seconds), then stays warm:
+`mcp` is an injected object, not an import from the Python MCP SDK. It reaches only
+servers granted through this broker's explicit registry. Host/cloud connectors and
+another client's approvals are not automatically available.
 
 ```python
-mcp.servers                                  # available server names (any scope)
-mcp.failed                                   # connection failures with reasons
-print(mcp.help())                            # servers + scope + status; connects nothing
-mcp.call('github', 'create_issue', owner='me', repo='proj', title='Bug')
+print(mcp.help())                         # available names; starts no servers
+print(mcp.help('service', 'read_record'))  # full tool schema
+response = mcp.call('service', 'read_record', arguments={'id': '123'})
+data = response.get('structuredContent')
+text = mcp.text(response)                 # explicitly concatenate all text blocks
+response = await mcp.acall('service', 'read_record', arguments={'id': '456'})
 ```
 
-This is the reason to reach for the REPL when a task needs the *same* MCP tool many times — one loop replaces N tool calls:
+`mcp.call` blocks and returns the complete MCP envelope as a dict. `mcp.acall` is
+async and supports bounded fan-out. Legacy `await mcp.call(...)` is tolerated after
+one synchronous dispatch; prefer `acall` for async execution. Use the `arguments`
+dict for names colliding with `timeout`, `server`, `tool` or `arguments`. Never guess
+JSON by automatically parsing the first text block; inspect structuredContent or
+explicitly parse known text formats.
+
+A downstream `isError` raises a `ToolError` retaining `.result`. Pagination is
+bounded and complete or explicitly fails. `mcp.servers()` lists names;
+`mcp.list_tools(server)` returns definitions; `mcp.refresh()` reloads the registry.
+Connections are lazy and failures do not become empty successful listings.
+
+`mcp.journal()` records call metadata, not args/responses. Cancel/timeout stops new
+work and requests cancellation downstream; an already sent write may have succeeded.
+An `outcome_unknown` call must be reconciled with the target before retry. No script
+is automatically replayed and cancellation is not a transaction rollback.
+
+## Packages and output
+
+Use the actual worker interpreter, not a guessed shell/uv environment:
 
 ```python
-for f in files:
-    mcp.call('telegram-mcp', 'download_media', chat_id=f['chat'], message_id=f['id'])
+import shlex, sys
+sh('uv pip install --python ' + shlex.quote(sys.executable) + ' PACKAGE==VERSION')
 ```
 
-Only claude.ai host connectors (Notion/Gmail/Drive/claude-in-chrome) are **not** reachable — those are server-managed with nothing on disk, so call their tools directly. Arguments must be JSON-serializable.
-
-If a server name isn't found, the error lists what *is* available — check `print(mcp.help())` rather than assuming the bridge is empty.
-
-## Missing packages
-
-The REPL env is ephemeral per release build. Install into the *running* env:
-
-```python
-sh('uv pip install openpyxl')
-```
-
-## Output truncation
-
-stdout truncates at **50KB**, return values at **20KB**. Aggregate and summarize in-REPL rather than dumping raw results. Slice large return values (`results[:10]`).
+Prefer an explicitly configured reproducible venv. Reset may be needed after an
+install. Summarize large results or write them to an explicit file. Streams cap at
+50,000 UTF-8 bytes during capture, previews at 20,000 bytes. Structured execution
+results report success, run/session/generation IDs, error, truncation and elapsed time.
+Custom repr is not implicitly called. Native fd output is separate from protocol.
+No fixed latency/SLA is promised.
