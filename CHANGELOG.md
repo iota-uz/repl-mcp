@@ -8,6 +8,10 @@
   cancellation are unchanged.
 - Update native wheel/plugin launch URLs and package metadata to 3.0.1. Add
   Cargo repository, homepage and documentation links.
+- Fix a cancellation cleanup race that briefly rejected the next cell as busy
+  after its predecessor had already disappeared from active-run inspection.
+  A new execution waits within a bounded deadline for cancellation cleanup;
+  overlapping an active cell still fails promptly.
 
 Upgrade the runtime and plugin together. The platform wheel launcher continues
 to use published GitHub assets and does not compile Rust on its default path.
