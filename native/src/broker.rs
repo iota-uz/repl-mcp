@@ -42,11 +42,11 @@ struct CallRecord {
 }
 impl CallRecord {
     fn set_status(&mut self, status: &str) {
-        if let Ok(mut journal) = self.journal.lock() {
-            if let Some(v) = journal.iter_mut().find(|v| v["id"] == self.id) {
-                v["status"] = json!(status);
-                v["finished_ms"] = json!(now_ms());
-            }
+        if let Ok(mut journal) = self.journal.lock()
+            && let Some(v) = journal.iter_mut().find(|v| v["id"] == self.id)
+        {
+            v["status"] = json!(status);
+            v["finished_ms"] = json!(now_ms());
         }
         self.finished = true;
     }
@@ -376,12 +376,12 @@ impl Broker {
         if op != "refresh" {
             self.refresh_if_due().await?;
         }
-        if matches!(op, "servers" | "tools" | "call") {
-            if let Some(error) = self.config_error.lock().await.as_ref() {
-                return Err(format!(
-                    "MCP configuration error: {error}; repair registry then mcp.refresh()"
-                ));
-            }
+        if matches!(op, "servers" | "tools" | "call")
+            && let Some(error) = self.config_error.lock().await.as_ref()
+        {
+            return Err(format!(
+                "MCP configuration error: {error}; repair registry then mcp.refresh()"
+            ));
         }
         match op {
             "servers" => {
@@ -537,10 +537,10 @@ impl Broker {
                     })
                 });
                 if let Some(idle) = idle {
-                    if let Some(slot) = sessions.remove(&idle) {
-                        if let Ok(mut guard) = slot.try_lock() {
-                            retired = guard.take();
-                        }
+                    if let Some(slot) = sessions.remove(&idle)
+                        && let Ok(mut guard) = slot.try_lock()
+                    {
+                        retired = guard.take();
                     }
                 } else {
                     return Err("MCP broker has32 active transports; finish or cancel an existing run before connecting another server".into());
@@ -630,10 +630,13 @@ impl Broker {
                     if catalogue_bytes > 1024 * 1024 {
                         return Err("MCP tool catalogue exceeds1MiB; reduce exposed tools or configure allowedTools".into());
                     }
-                    if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                        if !names.insert(name.to_owned()) {
-                            return Err("MCP tool catalogue contains duplicate names; catalogue is ambiguous".into());
-                        }
+                    if let Some(name) = tool.get("name").and_then(Value::as_str)
+                        && !names.insert(name.to_owned())
+                    {
+                        return Err(
+                            "MCP tool catalogue contains duplicate names; catalogue is ambiguous"
+                                .into(),
+                        );
                     }
                     tools.push(tool.clone());
                 }
@@ -648,14 +651,13 @@ impl Broker {
             let Some(c) = &cursor else {
                 let value = Value::Array(tools);
                 let mut catalogue = self.catalogue.lock().await;
-                if catalogue.len() >= 32 {
-                    if let Some(oldest) = catalogue
+                if catalogue.len() >= 32
+                    && let Some(oldest) = catalogue
                         .iter()
                         .min_by_key(|(_, v)| v.0)
                         .map(|(k, _)| k.clone())
-                    {
-                        catalogue.remove(&oldest);
-                    }
+                {
+                    catalogue.remove(&oldest);
                 }
                 catalogue.insert(key, (tokio::time::Instant::now(), value.clone()));
                 return Ok(value);
@@ -670,10 +672,10 @@ impl Broker {
     async fn invalidate(&self, key: &str) {
         self.catalogue.lock().await.clear();
         let slot = self.sessions.lock().await.remove(key);
-        if let Some(slot) = slot {
-            if let Some(session) = slot.lock().await.take() {
-                close_session(session).await;
-            }
+        if let Some(slot) = slot
+            && let Some(session) = slot.lock().await.take()
+        {
+            close_session(session).await;
         }
     }
     pub async fn refresh(&self) -> Result<(), String> {
@@ -773,10 +775,10 @@ impl Broker {
             .collect::<Vec<_>>();
         let mut connected = 0;
         for slot in slots {
-            if let Ok(guard) = slot.try_lock() {
-                if guard.as_ref().is_some_and(|s| !s.is_closed()) {
-                    connected += 1;
-                }
+            if let Ok(guard) = slot.try_lock()
+                && guard.as_ref().is_some_and(|s| !s.is_closed())
+            {
+                connected += 1;
             }
         }
         json!({"configured_servers":servers,"connected_transports":connected,"configuration_error":self.config_error.lock().await.clone(),"max_concurrent_requests":32,"authentication":"explicit headers, OAuth client credentials, independent PKCE browser grants", "journal":self.journal.lock().map(|j|j.len()).unwrap_or(0)})
@@ -1440,16 +1442,15 @@ impl rmcp::transport::Transport<RoleClient> for OwnedChildTransport {
     }
     async fn close(&mut self) -> Result<(), Self::Error> {
         let result = self.inner.close().await;
-        if let Some(mut child) = self.child.take() {
-            if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        if let Some(mut child) = self.child.take()
+            && tokio::time::timeout(Duration::from_secs(3), child.wait())
                 .await
                 .is_err()
-            {
-                unsafe {
-                    libc::kill(-(self.pid as i32), libc::SIGKILL);
-                }
-                let _ = child.wait().await;
+        {
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
             }
+            let _ = child.wait().await;
         }
         result
     }
@@ -1671,21 +1672,20 @@ impl rmcp::transport::streamable_http_client::StreamableHttpClient for BoundedHt
         }
         let body = bounded_body(response, max.min(1024 * 1024)).await?;
         if !status.is_success() {
-            if let Ok(parsed) = serde_json::from_slice::<rmcp::model::ServerJsonRpcMessage>(&body) {
-                if matches!(parsed, rmcp::model::ServerJsonRpcMessage::Error(_)) {
-                    return Ok(R::Json(parsed, session));
-                }
+            if let Ok(parsed) = serde_json::from_slice::<rmcp::model::ServerJsonRpcMessage>(&body)
+                && matches!(parsed, rmcp::model::ServerJsonRpcMessage::Error(_))
+            {
+                return Ok(R::Json(parsed, session));
             }
-            if let ClientJsonRpcMessage::Request(req) = &message {
-                if !attached
-                    && status.is_client_error()
-                    && matches!(req.request, ClientRequest::DiscoverRequest(_))
-                {
-                    let parsed = serde_json::from_value(
-                        json!({"jsonrpc":"2.0","id":req.id,"error":{"code":-32601,"message":"Server uses legacy MCP initialization"}}),
-                    )?;
-                    return Ok(R::Json(parsed, None));
-                }
+            if let ClientJsonRpcMessage::Request(req) = &message
+                && !attached
+                && status.is_client_error()
+                && matches!(req.request, ClientRequest::DiscoverRequest(_))
+            {
+                let parsed = serde_json::from_value(
+                    json!({"jsonrpc":"2.0","id":req.id,"error":{"code":-32601,"message":"Server uses legacy MCP initialization"}}),
+                )?;
+                return Ok(R::Json(parsed, None));
             }
             return Err(E::UnexpectedServerResponse(
                 "MCP HTTP request failed; body omitted".into(),

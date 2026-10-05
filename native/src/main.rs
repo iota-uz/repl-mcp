@@ -40,13 +40,13 @@ fn python_executable(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path;
     }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            for name in ["python", "python3"] {
-                let candidate = directory.join(name);
-                if candidate.is_file() {
-                    return candidate;
-                }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        for name in ["python", "python3"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return candidate;
             }
         }
     }

@@ -160,22 +160,19 @@ async fn owner() -> anyhow::Result<()> {
         let mut frames = FramedRead::new(child_output, LinesCodec::new_with_max_length(1_048_576));
         let mut output = tokio::io::stdout();
         while let Some(Ok(frame)) = frames.next().await {
-            if spec.worker {
-                if let Ok(event) = serde_json::from_str::<Value>(&frame) {
-                    if event["type"] == "job" {
-                        if let Some(pid) = event["pid"]
-                            .as_u64()
-                            .and_then(|v| u32::try_from(v).ok())
-                            .filter(|pid| *pid > 1)
-                        {
-                            let mut jobs = output_jobs.lock().unwrap();
-                            if event["action"] == "started" {
-                                jobs.insert(pid);
-                            } else {
-                                jobs.remove(&pid);
-                            }
-                        }
-                    }
+            if spec.worker
+                && let Ok(event) = serde_json::from_str::<Value>(&frame)
+                && event["type"] == "job"
+                && let Some(pid) = event["pid"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|pid| *pid > 1)
+            {
+                let mut jobs = output_jobs.lock().unwrap();
+                if event["action"] == "started" {
+                    jobs.insert(pid);
+                } else {
+                    jobs.remove(&pid);
                 }
             }
             if output.write_all(frame.as_bytes()).await.is_err()
@@ -205,13 +202,12 @@ async fn owner() -> anyhow::Result<()> {
     {
         output_task.abort();
     }
-    if let Some(mut task) = stderr_task {
-        if tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+    if let Some(mut task) = stderr_task
+        && tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
             .await
             .is_err()
-        {
-            task.abort();
-        }
+    {
+        task.abort();
     }
     let _ = control.write_all(b"x");
     let _ = watcher.join();

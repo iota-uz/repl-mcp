@@ -556,10 +556,10 @@ impl Supervisor {
         if reset {
             Self::stop(&mut slot).await;
         }
-        if let Some(worker) = slot.as_mut() {
-            if !worker.live.load(Ordering::Acquire) {
-                Self::stop(&mut slot).await;
-            }
+        if let Some(worker) = slot.as_mut()
+            && !worker.live.load(Ordering::Acquire)
+        {
+            Self::stop(&mut slot).await;
         }
         let cleared = slot.is_none();
         if cleared {
@@ -711,14 +711,13 @@ impl Supervisor {
             active.cancel.cancel();
         }
         let background = self.background.lock().unwrap().take();
-        if let Some(mut task) = background {
-            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+        if let Some(mut task) = background
+            && tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
                 .is_err()
-            {
-                task.abort();
-                let _ = task.await;
-            }
+        {
+            task.abort();
+            let _ = task.await;
         }
         let mut slot = self.worker.lock().await;
         Self::stop(&mut slot).await;
