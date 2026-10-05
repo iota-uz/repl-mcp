@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.1 — 2026-10-06
+
+- Restore Claude Code tool catalogue compatibility by including top-level
+  `ttlMs: 0` and `cacheScope: "private"` fields in `tools/list` responses for
+  all supported protocol versions. Tool execution semantics, persistence and
+  cancellation are unchanged.
+- Update native wheel/plugin launch URLs and package metadata to 3.0.1. Add
+  Cargo repository, homepage and documentation links.
+
+Upgrade the runtime and plugin together. The platform wheel launcher continues
+to use published GitHub assets and does not compile Rust on its default path.
+
 ## 3.0.0 — 2026-10-06
 
 The MCP server, broker and process supervisor now run in Rust. Cells still execute

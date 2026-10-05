@@ -115,6 +115,21 @@ def test_structured_error_and_schema(native):
     assert recovered["structuredContent"]["return_value"] == "4"
 
 
+@pytest.mark.parametrize("protocol", ["2025-03-26", "2025-11-25", "2026-07-28"])
+def test_tools_list_cache_hints_match_protocol(binary, tmp_path, protocol):
+    client = NativeClient(binary, tmp_path, protocol=protocol)
+    try:
+        result = client.request("tools/list", {})
+        assert {tool["name"] for tool in result["tools"]} == {
+            "execute_python", "python_start", "python_health", "python_run", "python_cancel",
+        }
+        assert type(result["ttlMs"]) is int
+        assert result["ttlMs"] == 0
+        assert result["cacheScope"] == "private"
+    finally:
+        client.close()
+
+
 def test_persistent_async_and_no_hidden_repr(native):
     assert not native.execute("import asyncio; lock = asyncio.Lock(); counter = 0")["isError"]
     assert not native.execute("await lock.acquire(); lock.release()")["isError"]
@@ -147,7 +162,8 @@ def test_client_cancel_stops_late_effect(native, tmp_path):
         "code": f"import time\ntime.sleep(2)\nopen({str(marker)!r}, 'w').write('late')"}})
     time.sleep(.3)
     native.send({"method": "notifications/cancelled", "params": {"requestId": request_id}})
-    assert native.execute("42")["structuredContent"]["return_value"] == "42"
+    recovered = native.execute("42")
+    assert recovered["structuredContent"]["return_value"] == "42", recovered
     time.sleep(2.1)
     assert not marker.exists()
 

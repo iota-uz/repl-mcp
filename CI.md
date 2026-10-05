@@ -28,7 +28,7 @@ Actual local evidence and remaining rollout limits are recorded in
 
 ## Release artifacts
 
-`Release artifacts` builds on pushes to `rust-migration` and supports manual dispatch
+`Release artifacts` builds on pushes to `rust-migration`/`fix-claude-catalog` and supports manual dispatch
 with an exact 40-character `revision` SHA. Each job checks out and verifies that
 revision (or the triggering push SHA). Publication waits for both the complete
 Test matrix and these artifact checks. It has read-only repository access

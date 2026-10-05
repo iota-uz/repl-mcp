@@ -1,5 +1,9 @@
 # Rust migration contract
 
+Current patch: 3.0.1 adds top-level `ttlMs: 0` and `cacheScope: "private"` to
+`tools/list` responses for Claude Code catalogue compatibility across supported
+protocol versions; the runtime and broker contracts below are unchanged.
+
 Tracking: https://github.com/iota-uz/repl-mcp/issues/9 (63 audit findings).
 
 ## Decision

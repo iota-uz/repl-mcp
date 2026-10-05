@@ -2,9 +2,9 @@ use crate::{broker::Broker, supervisor::Supervisor};
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
-        Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        ErrorData, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+        ServerConfig, Tool,
     },
     service::RequestContext,
 };
@@ -182,10 +182,9 @@ impl ServerHandler for ReplServer {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            tools: tools().to_vec(),
-            ..Default::default()
-        })
+        Ok(ListToolsResult::with_all_items(tools().to_vec())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
     async fn call_tool(
         &self,

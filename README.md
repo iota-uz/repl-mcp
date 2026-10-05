@@ -11,14 +11,14 @@ Supported hosts: macOS and Linux. Windows job ownership is not implemented.
 
 ## Installation
 
-Download the wheel matching your host from the [v3.0.0 GitHub release](https://github.com/iota-uz/repl-mcp/releases/tag/v3.0.0):
+Download the wheel matching your host from the [v3.0.1 GitHub release](https://github.com/iota-uz/repl-mcp/releases/tag/v3.0.1):
 macOS arm64, macOS x86_64 or Linux x86_64 (glibc 2.28+). Python 3.10+ is required;
 binary wheels do not require a Rust compiler. Install the downloaded wheel in a
 dedicated environment:
 
 ```sh
 uv venv ~/.local/share/repl-mcp/venv --python 3.12
-uv pip install --python ~/.local/share/repl-mcp/venv/bin/python /absolute/path/repl_mcp-3.0.0-*.whl
+uv pip install --python ~/.local/share/repl-mcp/venv/bin/python /absolute/path/repl_mcp-3.0.1-*.whl
 ~/.local/share/repl-mcp/venv/bin/repl-mcp --help
 ```
 
