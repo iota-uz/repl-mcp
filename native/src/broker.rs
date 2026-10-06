@@ -437,12 +437,11 @@ impl Broker {
         op: &str,
         params: Value,
     ) -> Result<Value, String> {
-        if op != "refresh" {
-            if let Err(error) = self.refresh_if_due().await {
-                if op != "explain" {
-                    return Err(error);
-                }
-            }
+        if op != "refresh"
+            && let Err(error) = self.refresh_if_due().await
+            && op != "explain"
+        {
+            return Err(error);
         }
         if matches!(op, "servers" | "tools" | "call")
             && let Some(error) = self.config_error.lock().await.as_ref()
