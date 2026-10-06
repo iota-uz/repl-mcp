@@ -1497,10 +1497,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repl-mcp"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "futures-util",
  "jsonschema",
@@ -1510,6 +1511,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "sse-stream",
  "tokio",
  "tokio-util",

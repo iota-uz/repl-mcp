@@ -3,7 +3,7 @@ use crate::broker::Broker;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
@@ -26,6 +26,42 @@ const FRAME_LIMIT: usize = 1_048_576;
 const CODE_LIMIT: usize = 262_144;
 const HISTORY_LIMIT: usize = 64;
 const WORKER_SOURCE: &str = include_str!("../../src/repl_mcp/native_worker.py");
+type RpcTasks = Arc<StdMutex<HashMap<(String, String), tokio::task::AbortHandle>>>;
+
+async fn forward_artifact(
+    store: &Arc<crate::artifacts::Artifacts>,
+    broker: &Broker,
+    owner: &str,
+    run: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let field = |key| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Artifact forwarding {key} must be a string"))
+    };
+    let payload = store
+        .forward_payload(
+            owner,
+            field("id")?,
+            params["format"].as_str().unwrap_or("json"),
+        )
+        .await?;
+    let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    if !arguments.is_object() {
+        return Err("Artifact forwarding arguments must be an object".into());
+    }
+    arguments[field("argument")?] = payload;
+    broker
+        .dispatch_with_context(
+            owner,
+            run,
+            "call",
+            json!({"server":field("server")?,"tool":field("tool")?,"arguments":arguments}),
+        )
+        .await
+}
 
 struct Worker {
     child: Child,
@@ -36,7 +72,7 @@ struct Worker {
     stderr: JoinHandle<()>,
     raw_stderr: Arc<StdMutex<Vec<u8>>>,
     stderr_sync: mpsc::Sender<oneshot::Sender<()>>,
-    rpc: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    rpc: RpcTasks,
     run: Arc<StdMutex<Option<(String, CancellationToken)>>>,
     jobs: Arc<StdMutex<HashSet<u32>>>,
     alive: bool,
@@ -69,7 +105,7 @@ impl Drop for Worker {
         self.stdin.stop.cancel();
         self.writer.abort();
         self.stderr.abort();
-        for task in self.rpc.lock().unwrap().drain(..) {
+        for (_, task) in self.rpc.lock().unwrap().drain() {
             task.abort();
         }
     }
@@ -104,6 +140,9 @@ struct ExecutionGuard<'a> {
     owner: &'a Supervisor,
     id: String,
     started: Instant,
+    fresh: bool,
+    generation: u64,
+    record: bool,
 }
 impl Drop for ExecutionGuard<'_> {
     fn drop(&mut self) {
@@ -112,7 +151,7 @@ impl Drop for ExecutionGuard<'_> {
             let mut result = failure(
                 &self.id,
                 "Request abandoned; worker killed; external effects may already have occurred",
-                "cleared",
+                if self.fresh { "preserved" } else { "cleared" },
                 self.started,
             );
             if let Some(active) = self.owner.active.lock().unwrap().as_ref() {
@@ -123,7 +162,10 @@ impl Drop for ExecutionGuard<'_> {
                 bound_execution_output(&mut result);
                 active.cancel.cancel();
             }
-            self.owner.remember(result);
+            self.owner.identify(&mut result, self.generation);
+            if self.record {
+                self.owner.remember(result);
+            }
         }
         *self.owner.active.lock().unwrap() = None;
     }
@@ -141,14 +183,20 @@ struct Active {
 }
 
 struct Reservation<'a> {
+    record: bool,
     owner: &'a Supervisor,
     id: String,
     started: Instant,
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
+        if let Some(store) = self.owner.artifacts.lock().unwrap().clone() {
+            // Pending uploads never outlive their owning cell. This is
+            // synchronous metadata cleanup, including abandoned futures.
+            let _ = store.abort_unfinished_uploads(self.owner.session_id(), &self.id);
+        }
         let abandoned = self.owner.active.lock().unwrap().take().is_some();
-        if abandoned {
+        if abandoned && self.record {
             self.owner.remember(failure(
                 &self.id,
                 "Execution abandoned before completion",
@@ -163,6 +211,10 @@ impl Drop for Reservation<'_> {
 
 pub struct Supervisor {
     python: PathBuf,
+    artifacts: StdMutex<Option<Arc<crate::artifacts::Artifacts>>>,
+    project: PathBuf,
+    server_id: String,
+    closed: AtomicBool,
     broker: Arc<Broker>,
     worker: Mutex<Option<Worker>>,
     active: StdMutex<Option<Active>>,
@@ -175,6 +227,28 @@ pub struct Supervisor {
     busy: AtomicBool,
     background: StdMutex<Option<JoinHandle<()>>>,
     available: Notify,
+}
+
+pub struct Execution {
+    pub code: String,
+    pub reset: bool,
+    pub timeout: f64,
+    pub expected_generation: Option<u64>,
+    pub extra: Value,
+    pub fresh: bool,
+}
+
+impl Execution {
+    pub fn code(code: String, reset: bool, timeout: f64) -> Self {
+        Self {
+            code,
+            reset,
+            timeout,
+            expected_generation: None,
+            extra: Value::Null,
+            fresh: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -233,9 +307,30 @@ async fn send(stdin: &FrameWriter, message: &Value) -> Result<(), String> {
 }
 
 impl Supervisor {
+    #[cfg(test)]
     pub fn new(python: PathBuf, broker: Arc<Broker>, max_memory_mib: u64) -> Self {
+        Self::with_context(
+            python,
+            broker,
+            max_memory_mib,
+            std::env::current_dir().unwrap(),
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    pub fn with_context(
+        python: PathBuf,
+        broker: Arc<Broker>,
+        max_memory_mib: u64,
+        project: PathBuf,
+        server_id: String,
+    ) -> Self {
         Self {
             python,
+            artifacts: StdMutex::new(None),
+            project,
+            server_id,
+            closed: AtomicBool::new(false),
             broker,
             worker: Mutex::new(None),
             active: StdMutex::new(None),
@@ -251,12 +346,12 @@ impl Supervisor {
         }
     }
 
-    async fn spawn(&self) -> Result<Worker, String> {
+    async fn spawn(&self, persistent: bool) -> Result<Worker, String> {
         let mut child = crate::guardian::spawn_owned(crate::guardian::CommandSpec {
             program: self.python.to_string_lossy().into_owned(),
             args: vec!["-u".into(), "-c".into(), WORKER_SOURCE.into()],
             env: [("REPL_MCP_NO_BRIDGE".into(), "1".into())].into(),
-            cwd: None,
+            cwd: Some(self.project.clone()),
             worker: true,
         })
         .await?;
@@ -294,8 +389,10 @@ impl Supervisor {
         let live = Arc::new(AtomicBool::new(true));
         let reader_live = live.clone();
         let broker = self.broker.clone();
+        let session_id = self.session_id.clone();
+        let artifacts = self.artifacts.lock().unwrap().clone();
         let writer = stdin.clone();
-        let rpc: Arc<StdMutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let rpc: RpcTasks = Arc::default();
         let run: Arc<StdMutex<Option<(String, CancellationToken)>>> = Arc::default();
         let run_info = run.clone();
         let jobs: Arc<StdMutex<HashSet<u32>>> = Arc::default();
@@ -329,31 +426,80 @@ impl Supervisor {
                             jobs.remove(&pid);
                         }
                     }
+                } else if event["type"] == "rpc_cancel" {
+                    let authorized = run_info
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(id, _)| event["run_id"] == *id);
+                    if authorized
+                        && let (Some(run), Some(id)) =
+                            (event["run_id"].as_str(), event["id"].as_str())
+                        && let Some(task) = tasks.lock().unwrap().remove(&(run.into(), id.into()))
+                    {
+                        task.abort();
+                    }
                 } else if event["type"] == "rpc" {
                     let authorized = run_info
                         .lock()
                         .unwrap()
                         .as_ref()
                         .is_some_and(|(id, ct)| event["run_id"] == *id && !ct.is_cancelled());
+                    let key = event["run_id"]
+                        .as_str()
+                        .zip(event["id"].as_str())
+                        .map(|(run, id)| (run.to_owned(), id.to_owned()));
                     let full = {
                         let mut pending = tasks.lock().unwrap();
-                        pending.retain(|task| !task.is_finished());
+                        pending.retain(|_, task| !task.is_finished());
                         pending.len() >= 64
+                            || key.as_ref().is_none_or(|key| pending.contains_key(key))
                     };
                     if full || !authorized {
                         let _ = send(&writer, &json!({"type":"rpc_result","id":event["id"],"error":"Too many outstanding MCP calls","result":null})).await;
                         continue;
                     }
                     let broker = broker.clone();
+                    let session_id = session_id.clone();
+                    let artifacts = artifacts.clone();
                     let writer = writer.clone();
                     let handle = tokio::spawn(async move {
-                        let result = broker
-                            .dispatch_with_run(
-                                event["run_id"].as_str().unwrap_or(""),
-                                event["op"].as_str().unwrap_or(""),
-                                event["params"].clone(),
-                            )
-                            .await;
+                        let op = event["op"].as_str().unwrap_or("");
+                        let result = if op.starts_with("artifact.") {
+                            match artifacts {
+                                Some(store) => {
+                                    let mut params = event["params"].clone();
+                                    if let Some(params) = params.as_object_mut() {
+                                        params.insert("_run_id".into(), event["run_id"].clone());
+                                        let params = Value::Object(params.clone());
+                                        if op == "artifact.forward" {
+                                            forward_artifact(
+                                                &store,
+                                                &broker,
+                                                &session_id,
+                                                event["run_id"].as_str().unwrap_or(""),
+                                                &params,
+                                            )
+                                            .await
+                                        } else {
+                                            store.dispatch(&session_id, op, params).await
+                                        }
+                                    } else {
+                                        Err("Artifact parameters must be an object".into())
+                                    }
+                                }
+                                None => Err("Artifacts are unavailable in this supervisor".into()),
+                            }
+                        } else {
+                            broker
+                                .dispatch_with_context(
+                                    &session_id,
+                                    event["run_id"].as_str().unwrap_or(""),
+                                    op,
+                                    event["params"].clone(),
+                                )
+                                .await
+                        };
                         let (result, error) = match result {
                             Ok(v) => (v, Value::Null),
                             Err(e) => (Value::Null, Value::String(e)),
@@ -363,7 +509,10 @@ impl Supervisor {
                             let _ = send(&writer, &json!({"type":"rpc_result","id":event["id"],"result":null,"error":"MCP result exceeds IPC limit; call may have completed. Inspect mcp.journal(); do not blindly retry external writes."})).await;
                         }
                     });
-                    tasks.lock().unwrap().push(handle.abort_handle());
+                    tasks
+                        .lock()
+                        .unwrap()
+                        .insert(key.unwrap(), handle.abort_handle());
                 } else if tx.send(event).await.is_err() {
                     break;
                 }
@@ -398,13 +547,16 @@ impl Supervisor {
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .ok_or("Worker handshake omitted real PID")?;
-        *self.runtime.lock().unwrap() = Some(ready);
-        *self.live.lock().unwrap() = Some(live);
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        if persistent {
+            *self.runtime.lock().unwrap() = Some(ready);
+            *self.live.lock().unwrap() = Some(live);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(worker)
     }
 
-    fn remember(&self, result: Value) {
+    fn remember(&self, mut result: Value) {
+        self.identify(&mut result, self.generation());
         let mut records = self.records.lock().unwrap();
         records.retain(|record| record["run_id"] != result["run_id"]);
         records.push_back(result);
@@ -438,6 +590,7 @@ impl Supervisor {
         true
     }
 
+    #[cfg(test)]
     pub async fn execute(
         &self,
         code: String,
@@ -445,7 +598,17 @@ impl Supervisor {
         timeout: f64,
         request_cancel: CancellationToken,
     ) -> Value {
+        self.execute_request(Execution::code(code, reset, timeout), request_cancel)
+            .await
+    }
+
+    pub async fn execute_request(
+        &self,
+        execution: Execution,
+        request_cancel: CancellationToken,
+    ) -> Value {
         let id = uuid::Uuid::new_v4().to_string();
+        let record = execution.extra["inventory"] != true;
         let cancel = CancellationToken::new();
         let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
         loop {
@@ -476,21 +639,37 @@ impl Supervisor {
             );
         }
         let _reservation = Reservation {
+            record,
             owner: self,
             id: id.clone(),
             started: Instant::now(),
         };
-        let result = self
-            .execute_inner(id, code, reset, timeout, request_cancel, cancel)
-            .await;
+        let mut result = match self.register_artifact_run(&id) {
+            Ok(()) => {
+                self.execute_inner(id, request_cancel, cancel, execution)
+                    .await
+            }
+            Err(error) => failure(&id, &error, "preserved", Instant::now()),
+        };
+        self.identify(&mut result, self.generation());
         *self.active.lock().unwrap() = None;
-        self.remember(result.clone());
+        if record {
+            self.remember(result.clone());
+        }
         result
     }
 
+    #[cfg(test)]
     pub fn start(self: &Arc<Self>, code: String, reset: bool, timeout: f64) -> Value {
+        self.start_request(Execution::code(code, reset, timeout))
+    }
+
+    pub fn start_request(self: &Arc<Self>, execution: Execution) -> Value {
         let id = uuid::Uuid::new_v4().to_string();
-        if code.len() > CODE_LIMIT || !timeout.is_finite() || !(0.01..=3600.0).contains(&timeout) {
+        if execution.code.len() > CODE_LIMIT
+            || !execution.timeout.is_finite()
+            || !(0.01..=3600.0).contains(&execution.timeout)
+        {
             return json!({"error":"Code limit is 256 KiB; timeout must be 0.01..3600 seconds"});
         }
         let cancel = CancellationToken::new();
@@ -501,37 +680,53 @@ impl Supervisor {
         let run_id = id.clone();
         let task = tokio::spawn(async move {
             let _reservation = Reservation {
+                record: true,
                 owner: &owner,
                 id: run_id.clone(),
                 started: Instant::now(),
             };
-            let result = owner
-                .execute_inner(
-                    run_id,
-                    code,
-                    reset,
-                    timeout,
-                    CancellationToken::new(),
-                    cancel,
-                )
-                .await;
+            let result = match owner.register_artifact_run(&run_id) {
+                Ok(()) => {
+                    owner
+                        .execute_inner(run_id, CancellationToken::new(), cancel, execution)
+                        .await
+                }
+                Err(error) => failure(&run_id, &error, "preserved", Instant::now()),
+            };
             *owner.active.lock().unwrap() = None;
             owner.remember(result);
         });
         *self.background.lock().unwrap() = Some(task);
-        json!({"run_id":id,"session_id":self.session_id,"status":"starting","poll_tool":"python_run","cancel_tool":"python_cancel"})
+        json!({"server_id":self.server_id,"generation":self.generation(),"run_id":id,"session_id":self.session_id,"status":"starting","poll_tool":"python_run","cancel_tool":"python_cancel"})
     }
 
     async fn execute_inner(
         &self,
         id: String,
-        code: String,
-        reset: bool,
-        timeout: f64,
         request_cancel: CancellationToken,
         cancel: CancellationToken,
+        execution: Execution,
     ) -> Value {
+        let Execution {
+            code,
+            reset,
+            timeout,
+            expected_generation,
+            extra,
+            fresh,
+        } = execution;
         let started = Instant::now();
+        if self.closed.load(Ordering::Acquire) {
+            return failure(&id, "Session is closed", "preserved", started);
+        }
+        if expected_generation.is_some_and(|expected| expected != self.generation()) {
+            return failure(
+                &id,
+                "STATE_CHANGED: stale expected_generation; inspect the session before executing",
+                "preserved",
+                started,
+            );
+        }
         if cancel.is_cancelled() || request_cancel.is_cancelled() {
             return failure(
                 &id,
@@ -556,24 +751,45 @@ impl Supervisor {
                 started,
             );
         };
-        if reset {
+        if reset && !fresh {
             Self::stop(&mut slot).await;
         }
-        if let Some(worker) = slot.as_mut()
+        if !fresh
+            && let Some(worker) = slot.as_mut()
             && !worker.live.load(Ordering::Acquire)
         {
             Self::stop(&mut slot).await;
         }
         let cleared = slot.is_none();
-        if cleared {
-            match self.spawn().await {
+        if cleared && !fresh {
+            match self.spawn(true).await {
                 Ok(worker) => *slot = Some(worker),
                 Err(error) => return failure(&id, &error, "cleared", started),
             }
         }
         // Own the child locally throughout execution. If the handler future is
         // dropped, Worker::drop kills/aborts the job and Tokio reaps its Child.
-        let mut worker = slot.take().unwrap();
+        let mut worker = if fresh {
+            match self.spawn(false).await {
+                Ok(worker) => worker,
+                Err(error) => return failure(&id, &error, "preserved", started),
+            }
+        } else {
+            slot.take().unwrap()
+        };
+        let generation = self.generation();
+        if !fresh
+            && !reset
+            && expected_generation.is_some_and(|expected| expected > 0 && expected != generation)
+        {
+            *slot = Some(worker);
+            return failure(
+                &id,
+                "STATE_CHANGED: worker restarted; expected_generation no longer matches",
+                "preserved",
+                started,
+            );
+        }
         worker.raw_stderr.lock().unwrap().clear();
         let output = Arc::new(StdMutex::new([String::new(), String::new()]));
         *self.active.lock().unwrap() = Some(Active {
@@ -592,10 +808,17 @@ impl Supervisor {
             owner: self,
             id: id.clone(),
             started,
+            fresh,
+            generation,
+            record: extra["inventory"] != true,
         };
         if cancel.is_cancelled() || request_cancel.is_cancelled() {
             guard.armed = false;
-            *slot = Some(worker);
+            if fresh {
+                worker.terminate().await;
+            } else {
+                *slot = Some(worker);
+            }
             return failure(
                 &id,
                 "Execution cancelled before dispatch",
@@ -603,7 +826,11 @@ impl Supervisor {
                 started,
             );
         }
-        let command = json!({"type":"execute","id":id,"code":code,"reset":false,"timeout":timeout});
+        let mut command =
+            json!({"type":"execute","id":id,"code":code,"reset":false,"timeout":timeout});
+        if let Some(extra) = extra.as_object() {
+            command.as_object_mut().unwrap().extend(extra.clone());
+        }
         let sent = send(&worker.stdin, &command).await;
         let deadline = tokio::time::sleep(Duration::from_secs_f64(timeout));
         tokio::pin!(deadline);
@@ -634,7 +861,7 @@ impl Supervisor {
         };
         if let Some(reason) = interruption {
             cancel.cancel();
-            for task in worker.rpc.lock().unwrap().drain(..) {
+            for (_, task) in worker.rpc.lock().unwrap().drain() {
                 task.abort();
             }
             for pid in worker.jobs.lock().unwrap().drain() {
@@ -657,7 +884,7 @@ impl Supervisor {
                 }
             };
         }
-        for task in worker.rpc.lock().unwrap().drain(..) {
+        for (_, task) in worker.rpc.lock().unwrap().drain() {
             task.abort();
         }
         *worker.run.lock().unwrap() = None;
@@ -680,12 +907,17 @@ impl Supervisor {
             }
         }
         guard.armed = false;
-        if result["state"] == "cleared" {
+        if fresh || result["state"] == "cleared" {
             worker.terminate().await;
         } else {
             *slot = Some(worker);
         }
-        result["state_reset"] = json!(cleared);
+        if fresh {
+            result["state"] = json!("preserved");
+        }
+        result["execution_mode"] = json!(if fresh { "fresh" } else { "persistent" });
+        result["state_reset"] = json!(cleared && !fresh);
+        self.identify(&mut result, generation);
         result["run_id"] = json!(id);
         result["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
         {
@@ -699,7 +931,6 @@ impl Supervisor {
         }
         bound_execution_output(&mut result);
         *self.active.lock().unwrap() = None;
-        self.remember(result.clone());
         result
     }
 
@@ -707,6 +938,13 @@ impl Supervisor {
         if let Some(mut worker) = slot.take() {
             worker.terminate().await;
         }
+    }
+
+    fn register_artifact_run(&self, id: &str) -> Result<(), String> {
+        if let Some(store) = self.artifacts.lock().unwrap().clone() {
+            store.register_run(self.session_id(), id)?;
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&self) {
@@ -724,6 +962,26 @@ impl Supervisor {
         }
         let mut slot = self.worker.lock().await;
         Self::stop(&mut slot).await;
+    }
+
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.shutdown().await;
+    }
+
+    pub fn set_artifacts(&self, store: Arc<crate::artifacts::Artifacts>) {
+        *self.artifacts.lock().unwrap() = Some(store);
+    }
+
+    pub fn broker(&self) -> &Arc<Broker> {
+        &self.broker
+    }
+
+    pub fn identify(&self, result: &mut Value, generation: u64) {
+        let object = result.as_object_mut().unwrap();
+        object.entry("server_id").or_insert(json!(self.server_id));
+        object.entry("session_id").or_insert(json!(self.session_id));
+        object.entry("generation").or_insert(json!(generation));
     }
 
     pub fn cancel(&self, id: Option<&str>) -> Value {
@@ -744,7 +1002,7 @@ impl Supervisor {
         if let Some(active) = active.as_ref().filter(|a| id.is_none_or(|id| id == a.id)) {
             let output = active.output.lock().unwrap();
             let raw = active.raw_stderr.lock().unwrap();
-            return json!({"run_id":active.id,"status":active.status,"elapsed_ms":active.started.elapsed().as_secs_f64()*1000.0,"stdout":output[0],"stderr":output[1],"native_stderr":String::from_utf8_lossy(&raw),"output_limit_bytes_per_stream":65536});
+            return json!({"server_id":self.server_id,"session_id":self.session_id,"generation":self.generation(),"run_id":active.id,"status":active.status,"elapsed_ms":active.started.elapsed().as_secs_f64()*1000.0,"stdout":output[0],"stderr":output[1],"native_stderr":String::from_utf8_lossy(&raw),"output_limit_bytes_per_stream":65536});
         }
         let records = self.records.lock().unwrap();
         records
@@ -766,7 +1024,7 @@ impl Supervisor {
                     .is_some_and(|live| live.load(Ordering::Acquire))
             );
         }
-        json!({"session_id":self.session_id,"generation":self.generation.load(Ordering::Relaxed),"version":env!("CARGO_PKG_VERSION"),"runtime":"rust-supervisor/cpython-worker","execution_mode":"trusted-local; full filesystem access; not a security sandbox","python_executable":self.python.to_string_lossy(),"python":runtime,"active_run":self.active.lock().unwrap().as_ref().map(|a| a.id.clone()),"limits":{"code_bytes":CODE_LIMIT,"frame_bytes":FRAME_LIMIT,"timeout_seconds":3600,"history_runs":HISTORY_LIMIT,"rpc_concurrency":64,"worker_rss_mib":self.max_memory_mib},"memory_limit":"Worker RSS sampled every 250ms during execution; descendants excluded; zero disables"})
+        json!({"server_id":self.server_id,"project":self.project,"closed":self.closed.load(Ordering::Acquire),"session_id":self.session_id,"generation":self.generation.load(Ordering::Relaxed),"version":env!("CARGO_PKG_VERSION"),"runtime":"rust-supervisor/cpython-worker","execution_mode":"trusted-local; full filesystem access; not a security sandbox","python_executable":self.python.to_string_lossy(),"python":runtime,"active_run":self.active.lock().unwrap().as_ref().map(|a| a.id.clone()),"limits":{"code_bytes":CODE_LIMIT,"frame_bytes":FRAME_LIMIT,"timeout_seconds":3600,"history_runs":HISTORY_LIMIT,"rpc_concurrency":64,"worker_rss_mib":self.max_memory_mib},"memory_limit":"Worker RSS sampled every 250ms during execution; descendants excluded; zero disables"})
     }
 
     pub fn session_id(&self) -> &str {

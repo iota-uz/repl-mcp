@@ -58,16 +58,34 @@ pub struct Registry {
     pub servers: BTreeMap<String, ServerConfig>,
     pub config: Option<PathBuf>,
     pub scope: String,
+    pub project: PathBuf,
+    pub present: bool,
+    pub excluded: BTreeMap<String, String>,
 }
 
 impl Registry {
-    pub fn load(config: Option<PathBuf>, scope: &str) -> Result<Self, String> {
-        let cwd =
-            std::env::current_dir().map_err(|_| "Cannot determine project directory".to_owned())?;
+    pub fn load_project(
+        config: Option<PathBuf>,
+        scope: &str,
+        project: &Path,
+    ) -> Result<Self, String> {
+        let project = project
+            .canonicalize()
+            .map_err(|_| "Broker project must be an existing directory")?;
+        if !project.is_dir() {
+            return Err("Broker project must be a directory".into());
+        }
+        let config = config.map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                project.join(path)
+            }
+        });
         Self::load_at(
             config,
             scope,
-            &cwd,
+            &project,
             std::env::var_os("HOME").as_deref().map(Path::new),
         )
     }
@@ -79,11 +97,16 @@ impl Registry {
         home: Option<&Path>,
     ) -> Result<Self, String> {
         let mut servers = BTreeMap::new();
+        let mut excluded = BTreeMap::new();
+        let mut present = false;
         if std::env::var("REPL_MCP_NO_BRIDGE").as_deref() == Ok("1") || scope == "none" {
             return Ok(Self {
                 servers,
                 config,
                 scope: scope.to_owned(),
+                project: cwd.to_owned(),
+                present,
+                excluded,
             });
         }
         let scopes: Vec<&str> = if scope == "all" {
@@ -100,13 +123,20 @@ impl Registry {
         if scopes.iter().any(|s| matches!(*s, "user" | "local")) {
             let home = home.ok_or("HOME unavailable for explicitly requested foreign registry")?;
             if let Some(doc) = read_document(&home.join(".claude.json"), false)? {
+                present = true;
                 if scopes.contains(&"user") {
+                    record_excluded(&mut excluded, doc.get("mcpServers"), true);
                     merge(&mut servers, doc.get("mcpServers"), cwd, true)?;
                 }
                 if scopes.contains(&"local") {
                     let project = doc
                         .get("projects")
                         .and_then(|p| p.get(cwd.to_string_lossy().as_ref()));
+                    record_excluded(
+                        &mut excluded,
+                        project.and_then(|p| p.get("mcpServers")),
+                        true,
+                    );
                     merge(
                         &mut servers,
                         project.and_then(|p| p.get("mcpServers")),
@@ -119,12 +149,14 @@ impl Registry {
         if scopes.contains(&"project") {
             let path = config.clone().unwrap_or_else(|| cwd.join(".mcp.json"));
             if let Some(doc) = read_document(&path, config.is_some())? {
+                present = true;
                 if doc.get("mcpServers").is_none() {
                     return Err(
                         "Project MCP registry requires mcpServers; check the registry format"
                             .into(),
                     );
                 }
+                record_excluded(&mut excluded, doc.get("mcpServers"), false);
                 merge(
                     &mut servers,
                     doc.get("mcpServers"),
@@ -137,16 +169,40 @@ impl Registry {
             servers,
             config,
             scope: scope.to_owned(),
+            project: cwd.to_owned(),
+            present,
+            excluded,
         })
     }
 
     pub fn reload(&self) -> Result<Self, String> {
-        Self::load(self.config.clone(), &self.scope)
+        Self::load_project(self.config.clone(), &self.scope, &self.project)
+    }
+}
+
+fn record_excluded(out: &mut BTreeMap<String, String>, entries: Option<&Value>, foreign: bool) {
+    if let Some(entries) = entries.and_then(Value::as_object) {
+        for (name, entry) in entries {
+            if foreign && entry.get("brokerAllowed").and_then(Value::as_bool) != Some(true) {
+                out.insert(name.clone(), "not_granted".into());
+            } else if entry.get("disabled").and_then(Value::as_bool) == Some(true) {
+                out.insert(name.clone(), "disabled".into());
+            } else {
+                out.remove(name);
+            }
+        }
     }
 }
 
 fn read_document(path: &Path, required: bool) -> Result<Option<Value>, String> {
-    let file = match std::fs::File::open(path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => return Ok(None),
         Err(_) => {
@@ -155,6 +211,15 @@ fn read_document(path: &Path, required: bool) -> Result<Option<Value>, String> {
             );
         }
     };
+    if !file
+        .metadata()
+        .map_err(|_| "Cannot inspect MCP registry")?
+        .is_file()
+    {
+        return Err(
+            "MCP registry must be a regular file; FIFOs and devices are unsupported".into(),
+        );
+    }
     use std::io::Read;
     let mut bytes = Vec::new();
     file.take(1024 * 1024 + 1)
@@ -218,6 +283,9 @@ fn merge(
                     .iter()
                     .map(|v| expand(v))
                     .collect::<Result<_, _>>()?;
+                if cfg.cwd.is_none() {
+                    cfg.cwd = Some(base.to_owned());
+                }
                 if is_self(&cfg) {
                     continue;
                 }
@@ -385,6 +453,52 @@ fn is_self(cfg: &ServerConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reload_is_bound_to_project_and_stdio_cwd_does_not_follow_host_launch_directory() {
+        let base =
+            std::env::temp_dir().join(format!("repl-project-registry-{}", uuid::Uuid::new_v4()));
+        let project_a = base.join("a");
+        let project_b = base.join("b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        std::fs::write(
+            project_a.join(".mcp.json"),
+            r#"{"mcpServers":{"peer":{"command":"echo","env":{"TOKEN":"a"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_b.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"echo"}}}"#,
+        )
+        .unwrap();
+        let a = Registry::load_project(None, "project", &project_a).unwrap();
+        let b = Registry::load_project(None, "project", &project_b).unwrap();
+        assert!(a.servers.contains_key("peer") && !b.servers.contains_key("peer"));
+        assert_eq!(
+            a.servers["peer"].cwd.as_ref().unwrap(),
+            &project_a.canonicalize().unwrap()
+        );
+        assert!(a.reload().unwrap().servers.contains_key("peer"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn excluded_entries_report_grants_without_parsing_foreign_credentials() {
+        let mut excluded = BTreeMap::new();
+        record_excluded(
+            &mut excluded,
+            Some(
+                &serde_json::json!({"foreign":{"headers":{"Authorization":"do-not-read"}},"off":{"disabled":true,"brokerAllowed":true}}),
+            ),
+            true,
+        );
+        assert_eq!(excluded["foreign"], "not_granted");
+        assert_eq!(excluded["off"], "disabled");
+        assert!(
+            !serde_json::to_string(&excluded)
+                .unwrap()
+                .contains("do-not-read")
+        );
+    }
     #[test]
     fn rejects_missing_env_without_values() {
         assert!(

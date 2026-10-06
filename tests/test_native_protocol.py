@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeClient:
-    def __init__(self, binary, cwd, config=None, protocol="2025-11-25", extra_args=()):
+    def __init__(self, binary, cwd, config=None, protocol="2025-11-25", extra_args=(), mcp_scope="none"):
         command = [str(binary), "--python", sys.executable, "--transport", "stdio"]
-        command += ["--config", str(config)] if config else ["--mcp-scope", "none"]
+        command += ["--config", str(config)] if config else ["--mcp-scope", mcp_scope]
         command.extend(extra_args)
         self.protocol = protocol
         self.process = subprocess.Popen(
@@ -120,7 +120,7 @@ def test_tools_list_cache_hints_match_protocol(binary, tmp_path, protocol):
     client = NativeClient(binary, tmp_path, protocol=protocol)
     try:
         result = client.request("tools/list", {})
-        assert {tool["name"] for tool in result["tools"]} == {
+        assert {tool["name"] for tool in result["tools"]} >= {
             "execute_python", "python_start", "python_health", "python_run", "python_cancel",
         }
         assert type(result["ttlMs"]) is int

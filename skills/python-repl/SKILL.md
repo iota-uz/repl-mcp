@@ -9,8 +9,29 @@ Load `execute_python` through tool search when deferred. Use `python_health` to
 verify server version, selected Python interpreter, limits and broker configuration.
 For a long cell use `python_start` to obtain a run ID immediately, then poll or cancel.
 For MCP 2026-07-28, take `session_id` from health and pass it to execution; legacy
-clients can omit it. One cell runs at a time. `python_run` polls progress/result and
+clients can omit it. One cell runs at a time per session. `python_run` polls progress/result and
 `python_cancel` cancels an active run independently of Python execution.
+
+For parallel agents or a project-specific Python environment, open a dedicated
+session with `python_session_open(name, project, python?)` and pass its `session_id`
+to execution, polling and cancellation. Different sessions have independent variables,
+cwd, active runs and history. Names are labels, not identifiers: retain the returned ID.
+Inspect the reported environment; explicit Python takes precedence, an existing
+project `.venv` is used otherwise, and projects without `.venv` use the reported
+server default. Invalid explicit/project environments fail instead of falling back.
+
+Use `python_session_inspect(session_id, include_namespace=True)` after reconnecting
+or losing conversation context. It returns bounded names/types without custom repr.
+Pass `expected_generation` from the inspected state to execution when code depends
+on existing helpers. `STATE_CHANGED` means the code was not executed: inspect state
+and recreate needed helpers explicitly. Never replay code automatically after an
+unknown write outcome. Close only your own session with `python_session_close`.
+
+Use `python_execute_file(session_id, path, argv=[], mode="persistent")` for a saved
+Python script in the selected environment. `mode="fresh"` executes in a separate
+owned worker and preserves the persistent namespace. Both modes retain output,
+run identity and cancellation semantics. Relative file paths resolve against the
+session project; source tracebacks identify the actual file.
 
 ## Python and files
 
@@ -78,6 +99,11 @@ bounded and complete or explicitly fails. `mcp.servers()` lists names;
 `mcp.list_tools(server)` returns definitions; `mcp.refresh()` reloads the registry.
 Connections are lazy and failures do not become empty successful listings.
 
+When a broker tool is unavailable, use `mcp.explain(server, tool=None)` before
+repeated connect/retry attempts. It distinguishes registry/grant/credential failures
+from cached transport/catalogue state without probing the network. Host-client
+connector availability remains unknown; use its direct client tool if exposed.
+
 `mcp.journal()` records call metadata, not args/responses. Cancel/timeout stops new
 work and requests cancellation downstream; an already sent write may have succeeded.
 An `outcome_unknown` call must be reconciled with the target before retry. No script
@@ -98,3 +124,13 @@ install. Summarize large results or write them to an explicit file. Streams cap 
 results report success, run/session/generation IDs, error, truncation and elapsed time.
 Custom repr is not implicitly called. Native fd output is separate from protocol.
 No fixed latency/SLA is promised.
+
+Large supported expression values can include an `artifact` reference with
+`id`, byte `size`, `format` and `sha256`. Use MCP `artifact_read/save/forward/delete`
+with its owning `session_id`, or Python `artifact(value)` / `artifact(path=..., format=...)`
+and matching helpers. Read ranges explicitly; save or forward directly to avoid
+copying a complete payload through context. Binary hex/base64 requires an explicit
+encoding. Artifacts survive worker reset, expire on session close/server exit or
+bounded oldest-first eviction; retain saved files when longer durability is needed.
+Forwarding takes an explicit downstream server/tool/argument and follows its grant,
+schema and byte budget. It is an external effect with no automatic retry or rollback.

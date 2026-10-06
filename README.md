@@ -1,4 +1,4 @@
-# REPL MCP 3.0
+# REPL MCP
 
 A native Rust MCP server with a persistent CPython worker. Python remains the language
 of your cells; Rust owns the protocol, MCP broker, deadlines and process lifecycle.
@@ -11,14 +11,14 @@ Supported hosts: macOS and Linux. Windows job ownership is not implemented.
 
 ## Installation
 
-Download the wheel matching your host from the [v3.0.1 GitHub release](https://github.com/iota-uz/repl-mcp/releases/tag/v3.0.1):
+Download the wheel matching your host from the [v3.1.0 GitHub release](https://github.com/iota-uz/repl-mcp/releases/tag/v3.1.0):
 macOS arm64, macOS x86_64 or Linux x86_64 (glibc 2.28+). Python 3.10+ is required;
 binary wheels do not require a Rust compiler. Install the downloaded wheel in a
 dedicated environment:
 
 ```sh
 uv venv ~/.local/share/repl-mcp/venv --python 3.12
-uv pip install --python ~/.local/share/repl-mcp/venv/bin/python /absolute/path/repl_mcp-3.0.1-*.whl
+uv pip install --python ~/.local/share/repl-mcp/venv/bin/python /absolute/path/repl_mcp-3.1.0-*.whl
 ~/.local/share/repl-mcp/venv/bin/repl-mcp --help
 ```
 
@@ -62,6 +62,16 @@ For changes to broker discovery, result envelopes and helper APIs, follow the
 | `python_health()` | Inspect server/runtime/broker without starting Python or connecting servers |
 | `python_run(run_id=None)` | Inspect active execution or the latest retained result |
 | `python_cancel(run_id=None)` | Request cancellation of the active execution and linked MCP calls |
+| `python_session_open(name, project, python=None)` | Open an independent namespace with an explicit project/environment |
+| `python_session_list()` | Discover session IDs and environment metadata |
+| `python_session_inspect(session_id, include_namespace=False)` | Inspect environment/state and optionally bounded variable names/types |
+| `python_session_close(session_id)` | Stop one session and its owned work |
+| `python_execute_file(session_id, path, argv=[], mode="persistent")` | Run saved source in a persistent namespace or a fresh owned worker |
+| `artifact_create(session_id, path, format)` | Retain a file as JSON, text or binary without returning its whole body |
+| `artifact_read(session_id, id, offset=0, length=65536, encoding="text")` | Read an explicit byte range; hex/base64 are opt-in |
+| `artifact_save(session_id, id, path, overwrite=False)` | Save verified content without transferring it through agent context |
+| `artifact_forward(session_id, id, server, tool, argument, format="json")` | Forward bounded content directly into one downstream tool argument |
+| `artifact_delete(session_id, id)` | Release retained content |
 
 Results contain readable text and structured fields: `run_id`, `success`, `stdout`,
 `stderr`, `return_value`, `error`, `elapsed_ms`, `truncated` and `state`. Results also
@@ -71,7 +81,7 @@ set MCP `isError`; invalid tool arguments are protocol errors. Timing includes
 postprocessing. Normal interruption preserves variables; crashes or forced termination
 clear them. A reset restarts the worker and restores initial cwd/environment/loop.
 
-Only one cell runs at a time; overlapping executions fail promptly. Health and cancel
+Only one cell runs at a time per session; overlapping executions in that session fail promptly. Health and cancel
 remain available. For current MCP 2026-07-28 stateless requests, first call health,
 then pass its `server.session_id` to execution/start; a foreign session ID is rejected.
 Legacy clients can omit it. `python_start` avoids client request deadlines: poll
@@ -80,6 +90,37 @@ last 64 results. Output is bounded during writes
 in UTF-8 bytes, not after accumulating an unlimited buffer. Safe previews inspect
 small builtin values; custom `repr` is not executed implicitly. Native fd output is
 drained separately and never mixed into MCP stdout.
+
+### Independent sessions and project environments
+
+The follow-up design and historical acceptance evidence are recorded in
+[the session design audit](docs/design-session-audit.md).
+
+Parallel agents should open separate sessions and pass the returned ID to execution,
+polling and cancellation. Session names are labels; opening the same name twice does
+not share a namespace. Each session has its own variables, cwd, worker, active run
+and history. Closing or resetting one leaves the others running. The legacy default
+session remains available through `python_health`; close rejects this reserved
+session, whose state can instead be cleared with `reset=True`.
+
+An explicit `python` selects that executable. Otherwise an existing project's
+`.venv/bin/python` is selected; projects without `.venv` use the reported server
+default. Invalid explicit interpreters or incomplete existing `.venv` directories
+fail instead of silently choosing another environment. Inspect environment metadata
+before installing dependencies; installations must target the selected interpreter.
+
+Pass `expected_generation` to `execute_python`, `python_start` or
+`python_execute_file` when a cell depends on existing variables. A mismatch returns
+`STATE_CHANGED` before executing source. Session inspection includes generation
+and can list bounded variable names/types without evaluating their repr. This detects
+worker reset/recovery; it does not verify the meaning of variables changed by earlier
+successful cells. Server identity distinguishes a new server lifetime.
+
+`python_execute_file` uses real source filenames and accepts an argv list without
+shell quoting. `persistent` runs inside the session namespace. `fresh` uses a separate
+owned worker in the same environment and leaves the persistent namespace intact;
+progress, results and cancellation remain attached to the owning session. It does
+not provide filesystem isolation or undo external effects.
 
 ```python
 import asyncio
@@ -165,6 +206,44 @@ journal. `--journal /private/path/journal.json` optionally persists those metada
 records atomically with an exclusive process lock. Prior unfinished dispatches become
 `outcome_unknown` on recovery. An execution is not a transaction: cancellation cannot undo a committed write.
 Reconcile an unknown outcome with the target before retrying.
+
+`mcp.explain(server, tool=None)` reports configuration, grants, credential readiness,
+cached transport/catalogue state and suggested recovery actions without starting a
+server or making a network probe. Status distinguishes an absent registry/server,
+disabled broker, missing independent grant/credentials, disconnected transport,
+previous connection timeout and missing/stale catalogue. `ready` refers to observed
+cached state, not a fresh connectivity test. Host-client connector availability is
+reported as unknown: a local broker cannot discover those tools automatically.
+
+Session brokers use the selected project's registry; an explicit launch `--config`
+remains an intentional shared registry override. Same-project sessions reuse their
+broker connections. Different projects have separate pools, and closing the last
+session of a project shuts down its broker. Per-call cancellation does not invalidate
+an otherwise healthy transport used by another session.
+
+### Large results and artifacts
+
+Large supported trailing expression values return a bounded preview and an
+`artifact` reference containing `id`, `size` in bytes, `format` and `sha256`. Use
+the artifact tools to read a range, save it or forward it without copying the whole
+payload into conversation context. Inside Python, `artifact(value)` and
+`artifact(path=..., format=...)` explicitly retain JSON/text/bytes/files; matching
+`artifact_read`, `artifact_save`, `artifact_forward` and `artifact_delete` helpers
+use the same store. Custom objects are not implicitly serialized or repr'd.
+
+Artifacts belong to their session, survive worker resets, and expire on session
+close, server exit or oldest-first eviction. Unknown/expired references return an
+explicit error. Storage retains at most 64 entries / 64 MiB, with 16 MiB per artifact;
+Unfinished uploads and bounded I/O copies can each temporarily retain up to another
+64 MiB. Value uploads use chunks into unlinked Rust-owned files; cancellation and
+worker death discard unfinished uploads. Reads cap at 64 KiB per explicit range.
+Forwarding accepts artifacts up to 512 KiB and also enforces the broker's 256 KiB
+serialized argument budget and downstream grant/schema; larger payloads should be
+saved or split explicitly. Binary base64
+conversion requires an explicit request. Cancellation cannot undo a completed save
+or downstream write; forwarding follows the same unknown-outcome journal contract.
+A hard server kill during an explicit save can leave an adjacent temporary file;
+the store's own retained and unfinished files are unlinked from creation.
 
 Configuration errors omit secret values. `${VAR}` must exist and be nonempty;
 transport mismatches, unknown fields and empty Bearer headers fail explicitly.
