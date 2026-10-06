@@ -1,7 +1,9 @@
+mod artifacts;
 mod broker;
 mod config;
 mod guardian;
 mod server;
+mod sessions;
 mod supervisor;
 
 use clap::Parser;
@@ -72,8 +74,10 @@ fn main() -> anyhow::Result<()> {
 async fn run(options: Options) -> anyhow::Result<()> {
     // Kept for older launchers; all connections are now lazy regardless.
     let scope = options.mcp_scope;
-    let broker =
-        Arc::new(broker::Broker::from_config(options.config, scope).map_err(anyhow::Error::msg)?);
+    let config = options.config.clone();
+    let broker = Arc::new(
+        broker::Broker::from_config(options.config, scope.clone()).map_err(anyhow::Error::msg)?,
+    );
     if let Some(path) = options.journal {
         broker.set_journal(path).map_err(anyhow::Error::msg)?;
     }
@@ -84,12 +88,17 @@ async fn run(options: Options) -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?;
         return Ok(());
     }
-    let supervisor = Arc::new(supervisor::Supervisor::new(
-        python_executable(options.python),
-        broker.clone(),
-        options.max_memory_mib,
-    ));
-    let server = server::ReplServer::new(supervisor.clone(), broker.clone());
+    let sessions = Arc::new(
+        sessions::SessionManager::new(
+            python_executable(options.python),
+            broker.clone(),
+            options.max_memory_mib,
+            config,
+            scope,
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
+    let server = server::ReplServer::new(sessions.clone());
     let input = FramedRead::new(
         tokio::io::stdin(),
         rmcp::transport::async_rw::JsonRpcMessageCodec::<
@@ -113,7 +122,7 @@ async fn run(options: Options) -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
-    supervisor.shutdown().await;
+    sessions.shutdown().await;
     broker.shutdown().await;
     Ok(())
 }

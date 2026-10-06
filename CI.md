@@ -25,6 +25,9 @@ GIL-blocking native work, descendants, byte limits, async state and credential
 validation. These are reproducible wire tests, not live agent UI evaluations.
 Actual local evidence and remaining rollout limits are recorded in
 [audit coverage](docs/audit-coverage.md).
+The 3.1 follow-up adds independent project sessions, saved-file modes, artifact
+ownership, generation guards and historical behavioral regressions; see
+[session design acceptance](docs/design-session-audit.md).
 
 ## Release artifacts
 

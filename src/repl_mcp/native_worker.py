@@ -6,6 +6,7 @@ deadlines and memory budgets. Frames are private newline-delimited JSON v1.
 
 import ast
 import asyncio
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 import traceback
 import uuid
 import weakref
@@ -32,7 +34,7 @@ PREVIEW_BYTES = 20_000
 MAX_PENDING_RPC = 64
 CHECKPOINT_BYTES = 256 * 1024
 CHECKPOINT_ITEMS = 256
-RESERVED_NAMES = {"sh", "mcp", "checkpoint", "restore", "repl_history", "repl_source", "__name__", "__builtins__", "__repl_result__"}
+RESERVED_NAMES = {"sh", "mcp", "checkpoint", "restore", "repl_history", "repl_source", "repl_namespace", "artifact", "artifact_read", "artifact_save", "artifact_forward", "artifact_delete", "__name__", "__file__", "__builtins__", "__repl_result__"}
 RUN_CONTEXT = contextvars.ContextVar("repl_run", default=None)
 SOURCE_RUNS = 64
 SOURCE_BYTES = 1024 * 1024
@@ -45,6 +47,15 @@ def clean_text(text: str) -> str:
 def prefix(text: str, budget: int) -> str:
     """Bound encoding allocations even if the original string is huge."""
     return text[:budget].encode("utf-8", "replace")[:budget].decode("utf-8", "ignore")
+
+
+def type_name(kind):
+    # Read the builtin type slot directly, bypassing custom metaclass properties.
+    return type.__dict__["__name__"].__get__(kind)
+
+
+def exact_kind(kind, *builtins):
+    return any(kind is builtin for builtin in builtins)
 
 
 def safe_value(value, depth=0, budget=None):
@@ -69,7 +80,7 @@ def safe_value(value, depth=0, budget=None):
         if len(value) > 2000:
             raise ValueError("large string")
         return clean_text(value)
-    if kind in (list, tuple, HistoryResult):
+    if exact_kind(kind, list, tuple, HistoryResult):
         if len(value) > 100:
             raise ValueError("large collection")
         return [safe_value(item, depth + 1, budget) for item in value]
@@ -82,7 +93,7 @@ def safe_value(value, depth=0, budget=None):
 
 
 def preview(value):
-    if type(value) in (str, ShellResult):
+    if exact_kind(type(value), str, ShellResult):
         text = str.__str__(value)
         retained = prefix(text, PREVIEW_BYTES)
         rendered = json.dumps(retained, ensure_ascii=False)
@@ -97,9 +108,9 @@ def preview(value):
     except ValueError:
         kind = type(value)
         # Bypass custom metaclass attribute access as well as custom repr.
-        name = type.__getattribute__(kind, "__name__")
+        name = type_name(kind)
         suffix = ""
-        if kind in (str, bytes, list, tuple, dict, set, frozenset):
+        if exact_kind(kind, str, bytes, list, tuple, dict, set, frozenset):
             suffix = f"; length={len(value)}"
         return f"<{name}{suffix}; safe preview omitted>", None, True
 
@@ -263,6 +274,10 @@ class MCPBridge:
         """Inspect bounded dispatch/outcome records; never automatically retry writes."""
         return self._wait(self._future("journal", {}), 35)
 
+    def explain(self, server, tool=None):
+        """Explain this broker's explicit route without foreign host discovery."""
+        return self._wait(self._future("explain", {"server": server, "tool": tool}), 35)
+
     async def ajournal(self):
         """Async effect journal inspection within the originating active cell."""
         future = self._future("journal", {})
@@ -340,10 +355,11 @@ class Worker:
         self.namespace = {"__name__": "__repl__", "mcp": MCPBridge(self), "sh": self.sh,
                           "checkpoint": self.checkpoint, "restore": self.restore,
                           "repl_history": self.repl_history, "repl_source": self.repl_source}
+        self.namespace.update(self.extra_helpers())
         self.install_process_tracking()
 
-    def remember_source(self, identifier, source):
-        filename = f"<repl:{identifier}>"
+    def remember_source(self, identifier, source, filename=None):
+        filename = filename or f"<repl:{identifier}>"
         lines = source.splitlines(keepends=True)
         weight = sys.getsizeof(source) + sys.getsizeof(lines) + sum(map(sys.getsizeof, lines))
         while self.sources and (len(self.sources) >= SOURCE_RUNS or self.source_bytes + weight > SOURCE_BYTES):
@@ -365,6 +381,133 @@ class Worker:
         if entry is None:
             raise ValueError("Run source unknown or evicted (source history: 64 runs / 1 MiB)")
         return entry["source"]
+
+    def extra_helpers(self):
+        return {"repl_namespace": self.repl_namespace, "artifact": self.artifact,
+                "artifact_read": self.artifact_read, "artifact_save": self.artifact_save,
+                "artifact_forward": self.artifact_forward, "artifact_delete": self.artifact_delete}
+
+    def repl_namespace(self):
+        """Bounded metadata only: no user repr, attributes, iteration or sizing."""
+        entries, used = [], 0
+        total = len(self.namespace)
+        scanned = 0
+        for name, value in self.namespace.items():
+            scanned += 1
+            if scanned > 1024:
+                break
+            if type(name) is not str or name in RESERVED_NAMES:
+                continue
+            if len(entries) >= 512 or used >= 60000:
+                break
+            kind = type(value)
+            # Read builtin type slots, never custom metaclass descriptors.
+            kind_name = type_name(kind)
+            item = {"name": prefix(name, 256), "type": prefix(kind_name, 128)}
+            if exact_kind(kind, str, bytes, list, tuple, dict, set, frozenset):
+                item["length"] = len(value)
+            used += len(json.dumps(item).encode("utf-8"))
+            entries.append(item)
+        return {"variables": entries, "total_namespace_entries": total, "omitted_including_helpers": total - len(entries), "values_included": False}
+
+    def artifact_rpc(self, op, params):
+        return MCPBridge._wait(self.rpc("artifact." + op, params), 35)
+
+    def artifact(self, value=None, *, path=None, format=None):
+        """Explicit file/binary/JSON retention in the native server's bounded store."""
+        if path is not None:
+            if value is not None:
+                raise ValueError("Use either value or path")
+            return self.artifact_rpc("create", {"path": os.path.abspath(os.path.expanduser(os.fspath(path))), "format": format or "binary"})
+        # Internal chunk RPCs stream into native-owned, immediately unlinked
+        # files. No named worker spill can survive SIGKILL. The supervisor also
+        # aborts unfinished uploads at every run completion/cancellation/crash.
+        if type(value) is bytes:
+            if len(value) > 16 * 1024 * 1024:
+                raise ValueError("Artifact exceeds 16 MiB")
+            selected = format or "binary"
+            chunks = (value[index:index + 32768] for index in range(0, len(value), 32768))
+        elif type(value) is str:
+            selected = format or "text"
+            chunks = (value[index:index + 8192].encode("utf-8") for index in range(0, len(value), 8192))
+        else:
+            selected = format or "json"
+            converted = self.json_artifact_value(value)
+            def json_chunks():
+                for text in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(converted):
+                    for index in range(0, len(text), 8192):
+                        yield text[index:index + 8192].encode("utf-8")
+            chunks = json_chunks()
+        upload = self.artifact_rpc("begin", {"format": selected})["upload_id"]
+        committed = False
+        try:
+            size = 0
+            pending = bytearray()
+            for chunk in chunks:
+                if size + len(pending) + len(chunk) > 16 * 1024 * 1024:
+                    raise ValueError("Artifact exceeds 16 MiB")
+                position = 0
+                while position < len(chunk):
+                    count = min(32768 - len(pending), len(chunk) - position)
+                    pending.extend(chunk[position:position + count])
+                    position += count
+                    if len(pending) == 32768:
+                        self.artifact_rpc("append", {"upload_id": upload, "offset": size, "data": base64.b64encode(pending).decode("ascii")})
+                        size += len(pending)
+                        pending.clear()
+            if pending:
+                self.artifact_rpc("append", {"upload_id": upload, "offset": size, "data": base64.b64encode(pending).decode("ascii")})
+            reference = self.artifact_rpc("commit", {"upload_id": upload})
+            committed = True
+            return reference
+        finally:
+            if not committed and not isinstance(sys.exc_info()[1], (KeyboardInterrupt, asyncio.CancelledError)):
+                with contextlib.suppress(BaseException):
+                    self.artifact_rpc("abort", {"upload_id": upload})
+
+    @staticmethod
+    def json_artifact_value(value):
+        # A hard node/depth/string budget bounds conversion before serialization;
+        # exact builtin checks exclude custom iterators, descriptors and repr.
+        remaining = [100000, 16 * 1024 * 1024]
+        def visit(item, depth=0):
+            remaining[0] -= 1
+            if remaining[0] < 0 or depth > 32:
+                raise ValueError("Artifact JSON node/depth limit exceeded")
+            kind = type(item)
+            if item is None or kind is bool:
+                return item
+            if kind is int and item.bit_length() <= 4096:
+                return item
+            if kind is float and math.isfinite(item):
+                return item
+            if kind is str:
+                remaining[1] -= len(item) * 4
+                if remaining[1] < 0:
+                    raise ValueError("Artifact JSON string budget exceeded")
+                return item
+            if exact_kind(kind, list, tuple):
+                if len(item) > remaining[0]:
+                    raise ValueError("Artifact JSON item limit exceeded")
+                return [visit(child, depth + 1) for child in item]
+            if exact_kind(kind, dict, BridgeResult):
+                if len(item) * 2 > remaining[0] or any(type(key) is not str for key in item):
+                    raise ValueError("Artifact JSON dictionary limit/type exceeded")
+                return {visit(key, depth + 1): visit(child, depth + 1) for key, child in item.items()}
+            raise ValueError("Artifact supports only exact JSON builtins, bytes or explicit files")
+        return visit(value)
+
+    def artifact_read(self, artifact_id, *, offset=0, length=65536, encoding="text"):
+        return self.artifact_rpc("read", {"id": artifact_id, "offset": offset, "length": length, "encoding": encoding})
+
+    def artifact_save(self, artifact_id, path, *, overwrite=False):
+        return self.artifact_rpc("save", {"id": artifact_id, "path": os.path.abspath(os.path.expanduser(os.fspath(path))), "overwrite": overwrite})
+
+    def artifact_delete(self, artifact_id):
+        return self.artifact_rpc("drop", {"id": artifact_id})
+
+    def artifact_forward(self, artifact_id, server, tool, argument, *, format="json"):
+        return MCPBridge._check(self.artifact_rpc("forward", {"id": artifact_id, "server": server, "tool": tool, "argument": argument, "format": format}))
 
     def install_process_tracking(self):
         """Poll owned Popen objects without stealing wait() exit status.
@@ -504,6 +647,15 @@ class Worker:
         def remove(_future):
             with self.pending_lock:
                 self.pending.pop(identifier, None)
+            if _future.cancelled():
+                # Keep the originating identity even when cancellation happens
+                # during cell cleanup. Cancelling one call must not close the
+                # shared MCP peer or borrow the next cell's ownership.
+                try:
+                    self.send({"type": "rpc_cancel", "id": identifier,
+                               "run_id": origin})
+                except (OSError, ValueError):
+                    pass  # Parent teardown already owns remaining cleanup.
         future.add_done_callback(remove)
         return future
 
@@ -655,17 +807,62 @@ class Worker:
                   "return_value": None, "error": None, "elapsed_ms": 0,
                   "truncated": {"stdout": False, "stderr": False, "return": False},
                   "state": "preserved"}
+        if frame.get("inventory"):
+            # Inspection must not run the event loop, lookup namespace keys or
+            # restore helper bindings: malicious dictionary keys can overload
+            # equality/hash hooks even though the mapping itself is a builtin.
+            result["value"] = self.repl_namespace()
+            result["return_value"] = "Namespace metadata; inspect structured value"
+            result["elapsed_ms"] = (time.monotonic() - started) * 1000
+            self.send({"type": "result", "id": identifier, "result": result})
+            self.run_id = None
+            return
         filename = f"<repl:{identifier}>"
-        self.remember_source(identifier, frame["code"])
         baseline_tasks = asyncio.all_tasks(self.loop)
         baseline_handles = set(self.loop._scheduled) | set(self.loop._ready)
         baseline_threads = set(threading.enumerate())
         run_token = RUN_CONTEXT.set(identifier)
         fatal_background = False
+        previous_argv = sys.argv
+        previous_path = sys.path
+        previous_file = self.namespace.get("__file__")
+        had_file = "__file__" in self.namespace
+        previous_name = self.namespace.get("__name__", "__repl__")
         self.executing = True
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
-                tree = ast.parse(frame["code"], filename=filename, mode="exec")
+                source = frame.get("code", "")
+                if frame.get("source_path") is not None:
+                    filename = frame["source_path"]
+                    if type(filename) is not str or not os.path.isabs(filename):
+                        raise ValueError("source_path must be an absolute file path")
+                    with open(filename, "rb") as stream:
+                        encoded = stream.read(256 * 1024 + 1)
+                    if len(encoded) > 256 * 1024:
+                        raise ValueError("Python source file exceeds 256 KiB")
+                    encoding, _ = tokenize.detect_encoding(io.BytesIO(encoded).readline)
+                    source = encoded.decode(encoding)
+                    arguments = frame.get("argv", [])
+                    if type(arguments) is not list or len(arguments) > 128 or any(type(item) is not str for item in arguments):
+                        raise ValueError("argv must contain at most 128 strings")
+                    if sum(len(item.encode("utf-8")) for item in arguments) > 32768:
+                        raise ValueError("argv exceeds 32 KiB")
+                    sys.argv = [filename] + arguments
+                    sys.path = [os.path.dirname(filename)] + previous_path[1:]
+                    self.namespace["__file__"] = filename
+                    self.namespace["__name__"] = "__main__"
+                if frame.get("cwd") is not None:
+                    if type(frame["cwd"]) is not str or not os.path.isabs(frame["cwd"]):
+                        raise ValueError("cwd must be absolute")
+                    os.chdir(frame["cwd"])
+                if not frame.get("inventory"):
+                    self.remember_source(identifier, source, filename)
+                if frame.get("inventory"):
+                    result["value"] = self.repl_namespace()
+                    result["return_value"] = "Namespace metadata; inspect structured value"
+                    tree = ast.Module(body=[], type_ignores=[])
+                else:
+                    tree = ast.parse(source, filename=filename, mode="exec")
                 last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
                 if tree.body:
                     self.evaluate(tree, filename)
@@ -681,9 +878,26 @@ class Worker:
                         result["truncated"]["return"] = shortened
                         if not shortened:
                             result["value"] = converted
+                        elif frame.get("artifact_enabled") and exact_kind(type(value), str, bytes, list, tuple, dict, BridgeResult):
+                            try:
+                                result["artifact"] = self.artifact(value)
+                            except (ValueError, RuntimeError, concurrent.futures.TimeoutError) as error:
+                                result["artifact_error"] = prefix(str(error), 1000)
             except BaseException as exc:
                 result["success"] = False
-                if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                if frame.get("source_path") is not None and isinstance(exc, SystemExit):
+                    code = exc.code
+                    exit_code = 0 if code is None else int(code) if exact_kind(type(code), int, bool) else 1
+                    result["exit_code"] = exit_code
+                    result["success"] = exit_code == 0
+                    result["error"] = None if exit_code == 0 else f"Saved Python file exited with status {exit_code}"
+                    if code is not None and not exact_kind(type(code), int, bool):
+                        try:
+                            message = prefix(str(code), 4000)
+                        except BaseException:
+                            message = "exit message unavailable"
+                        stderr.write(message + "\n")
+                elif isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
                     result["error"] = f"Execution interrupted ({identifier}); namespace preserved"
                 else:
                     # Do not format helper stack frames or inspect namespace locals.
@@ -691,7 +905,7 @@ class Worker:
                         traceback.walk_tb(exc.__traceback__), limit=-20, lookup_lines=False)
                     locations = []
                     for entry in entries:
-                        if entry.filename.startswith("<repl:"):
+                        if entry.filename.startswith("<repl:") or any(entry.filename == item["filename"] for item in self.sources.values()):
                             locations.append(f'  File "{entry.filename}", line {entry.lineno}, in {entry.name}')
                             if entry.line:
                                 locations.append("    " + prefix(entry.line.strip(), 500))
@@ -730,6 +944,15 @@ class Worker:
                 self.namespace["restore"] = self.restore
                 self.namespace["repl_history"] = self.repl_history
                 self.namespace["repl_source"] = self.repl_source
+                self.namespace.update(self.extra_helpers())
+                if frame.get("source_path") is not None:
+                    sys.argv = previous_argv
+                    sys.path = previous_path
+                    self.namespace["__name__"] = previous_name
+                    if had_file:
+                        self.namespace["__file__"] = previous_file
+                    else:
+                        self.namespace.pop("__file__", None)
                 with self.pending_lock:
                     pending = [future for run, future in self.pending.values() if run == identifier]
                 for future in pending:
@@ -751,7 +974,7 @@ class Worker:
     def serve(self):
         signal.signal(signal.SIGINT, self.interrupt)
         threading.Thread(target=self.reader, name="worker-control", daemon=True).start()
-        self.send({"type": "ready", "python_version": sys.version.split()[0], "pid": os.getpid()})
+        self.send({"type": "ready", "python_version": sys.version.split()[0], "python_executable": sys.executable, "pid": os.getpid()})
         try:
             while True:
                 frame = self.commands.get()

@@ -18,6 +18,32 @@ use tokio::sync::{Mutex, Semaphore};
 type Session = RunningService<RoleClient, ()>;
 type Slot = Arc<Mutex<Option<Arc<Session>>>>;
 
+// A timed-out wait cannot stop OS filesystem IO. Keep the capacity permit in
+// the blocking closure until it actually finishes, preventing job accumulation.
+async fn registry_job<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    budget: Duration,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let permit = tokio::time::timeout_at(deadline, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            "Registry filesystem operation timed out; no additional job was scheduled".to_string()
+        })?
+        .map_err(|_| "Registry filesystem capacity unavailable".to_string())?;
+    let job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    tokio::time::timeout_at(deadline, job)
+        .await
+        .map_err(|_| {
+            "Registry filesystem operation timed out; OS IO may still be completing".to_string()
+        })?
+        .map_err(|_| "Registry filesystem operation failed".to_string())?
+}
+
 pub struct Broker {
     registry: Mutex<Registry>,
     sessions: Mutex<BTreeMap<String, Slot>>,
@@ -26,11 +52,12 @@ pub struct Broker {
     journal_path: Arc<StdMutex<Option<PathBuf>>>,
     journal_io: Arc<JournalIo>,
     catalogue: Mutex<BTreeMap<String, (tokio::time::Instant, Value)>>,
-    failures: Mutex<BTreeMap<String, tokio::time::Instant>>,
+    failures: Mutex<BTreeMap<String, (tokio::time::Instant, String)>>,
     refresh_at: Mutex<tokio::time::Instant>,
     validators: Mutex<BTreeMap<String, Arc<jsonschema::Validator>>>,
     config_error: Mutex<Option<String>>,
     validation_slots: Arc<Semaphore>,
+    registry_slots: Arc<Semaphore>,
 }
 
 struct CallRecord {
@@ -101,6 +128,24 @@ impl Drop for PendingRequest {
 
 impl Broker {
     pub fn from_config(config: Option<PathBuf>, scope: String) -> Result<Self, String> {
+        let project = std::env::current_dir().map_err(|_| "Cannot determine broker project")?;
+        Self::from_project(config, scope, project)
+    }
+    pub fn from_project(
+        config: Option<PathBuf>,
+        scope: String,
+        project: PathBuf,
+    ) -> Result<Self, String> {
+        let project = project
+            .canonicalize()
+            .map_err(|_| "Broker project must be an existing directory")?;
+        let config = config.map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                project.join(path)
+            }
+        });
         if scope != "all"
             && scope != "none"
             && scope
@@ -109,13 +154,16 @@ impl Broker {
         {
             return Err("MCP scopes must be project, user, local, all or none; export plugin servers into an explicit config file".into());
         }
-        match Registry::load(config.clone(), &scope) {
+        match Registry::load_project(config.clone(), &scope, &project) {
             Ok(registry) => Ok(Self::new(registry)),
             Err(error) => {
                 let mut broker = Self::new(Registry {
                     servers: BTreeMap::new(),
                     config,
                     scope,
+                    project,
+                    present: false,
+                    excluded: BTreeMap::new(),
                 });
                 broker.config_error = Mutex::new(Some(error));
                 Ok(broker)
@@ -136,7 +184,13 @@ impl Broker {
             validators: Mutex::new(BTreeMap::new()),
             config_error: Mutex::new(None),
             validation_slots: Arc::new(Semaphore::new(4)),
+            registry_slots: Arc::new(Semaphore::new(1)),
         }
+    }
+    pub fn inherit_journal(&mut self, parent: &Broker) {
+        self.journal = parent.journal.clone();
+        self.journal_path = parent.journal_path.clone();
+        self.journal_io = parent.journal_io.clone();
     }
     pub fn set_journal(&self, path: PathBuf) -> Result<(), String> {
         use std::io::Read;
@@ -200,14 +254,23 @@ impl Broker {
             if object.keys().any(|k| {
                 !matches!(
                     k.as_str(),
-                    "id" | "run_id" | "server" | "tool" | "started_ms" | "finished_ms" | "status"
+                    "id" | "session_id"
+                        | "project"
+                        | "run_id"
+                        | "server"
+                        | "tool"
+                        | "started_ms"
+                        | "finished_ms"
+                        | "status"
                 )
             }) {
                 return Err("Broker journal may contain metadata only".into());
             }
-            if object.values().any(|v| {
-                v.as_str()
-                    .is_some_and(|s| s.len() > 400 || s.chars().any(char::is_control))
+            if object.iter().any(|(key, v)| {
+                v.as_str().is_some_and(|s| {
+                    s.len() > (if key == "project" { 4096 } else { 400 })
+                        || s.chars().any(char::is_control)
+                })
             }) {
                 return Err("Invalid broker journal metadata".into());
             }
@@ -367,14 +430,19 @@ impl Broker {
         }
     }
 
-    pub async fn dispatch_with_run(
+    pub async fn dispatch_with_context(
         &self,
+        session_id: &str,
         run_id: &str,
         op: &str,
         params: Value,
     ) -> Result<Value, String> {
         if op != "refresh" {
-            self.refresh_if_due().await?;
+            if let Err(error) = self.refresh_if_due().await {
+                if op != "explain" {
+                    return Err(error);
+                }
+            }
         }
         if matches!(op, "servers" | "tools" | "call")
             && let Some(error) = self.config_error.lock().await.as_ref()
@@ -384,6 +452,7 @@ impl Broker {
             ));
         }
         match op {
+            "explain" => self.explain(&params).await,
             "servers" => {
                 let reg = self.registry.lock().await;
                 Ok(json!(reg.servers.keys().collect::<Vec<_>>()))
@@ -418,6 +487,25 @@ impl Broker {
                     .await
                     .map_err(|_| "MCP request budget exceeded while queued")?
                     .map_err(|_| "MCP broker stopped")?;
+                if op == "call" {
+                    let tool = params
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .ok_or("tool must be a string")?;
+                    if cfg
+                        .allowed_tools
+                        .as_ref()
+                        .is_some_and(|allow| !allow.iter().any(|name| name == tool))
+                    {
+                        return Err("Tool denied by broker allowedTools policy; mcp.explain(server, tool) describes the independent grant".into());
+                    }
+                    if params
+                        .get("arguments")
+                        .is_some_and(|arguments| !arguments.is_object())
+                    {
+                        return Err("arguments must be a JSON object".into());
+                    }
+                }
                 let (key, session) = self.session(&cfg, deadline).await?;
                 let result = if op == "tools" {
                     self.tools(&session, &cfg, deadline).await
@@ -450,15 +538,34 @@ impl Broker {
                     self.validate(definition.get("inputSchema"), &arguments, deadline)
                         .await?;
                     let id = format!("{}-{}", now_ms(), uuid::Uuid::new_v4());
+                    let project = self.registry.lock().await.project.clone();
                     {
                         let mut journal = self
                             .journal
                             .lock()
                             .map_err(|_| "Call journal unavailable")?;
                         if journal.len() >= 256 {
-                            journal.pop_front();
+                            let oldest_terminal = journal.iter().position(|record| record["status"] != "dispatched")
+                                .ok_or("Effect journal has 256 in-flight calls; finish or cancel one before dispatching another")?;
+                            journal.remove(oldest_terminal);
                         }
-                        journal.push_back(json!({"id":id,"run_id":run_id,"server":name,"tool":tool,"started_ms":now_ms(),"status":"dispatched"}));
+                        journal.push_back(json!({"id":id,"session_id":session_id,"project":project,"run_id":run_id,"server":name,"tool":tool,"started_ms":now_ms(),"status":"dispatched"}));
+                        // Reserve space for terminal timestamps and keep snapshots reloadable.
+                        while serde_json::to_vec(&*journal)
+                            .map_err(|_| "Cannot encode effect metadata")?
+                            .len()
+                            > 900000
+                        {
+                            if let Some(oldest_terminal) = journal
+                                .iter()
+                                .position(|record| record["status"] != "dispatched")
+                            {
+                                journal.remove(oldest_terminal);
+                            } else {
+                                journal.pop_back();
+                                return Err("Effect journal metadata budget exhausted by in-flight calls; no tool was dispatched".into());
+                            }
+                        }
                     }
                     let mut record = CallRecord {
                         journal: self.journal.clone(),
@@ -490,15 +597,245 @@ impl Broker {
                     } else {
                         record.finish("outcome_unknown").await.map_err(|_|"MCP outcome is unknown and durable journal update failed; do not retry blindly")?;
                     }
+                    if let Ok(envelope) = &result
+                        && serde_json::to_vec(envelope)
+                            .map_err(|_| "Cannot encode known MCP outcome")?
+                            .len()
+                            > 900000
+                    {
+                        return Err(format!(
+                            "MCP returned a known outcome for call {}, but its result exceeds the 900000-byte delivery budget. The journal retains the terminal status; do not retry a write merely to recover its output. Request a smaller result or downstream file/reference.",
+                            record.id
+                        ));
+                    }
                     result
                 };
-                if session.is_closed() || result.as_ref().is_err_and(|e| e.contains("transport")) {
+                // A protocol error or a cancelled call does not own the shared transport.
+                // Only an actually closed service is invalidated; healthy peers survive.
+                if session.is_closed() {
                     self.invalidate(&key).await;
                 }
                 result
             }
             _ => Err("Unknown MCP bridge operation".into()),
         }
+    }
+
+    async fn explain(&self, params: &Value) -> Result<Value, String> {
+        let name = params
+            .get("server")
+            .and_then(Value::as_str)
+            .ok_or("server must be a string")?;
+        let tool = match params.get("tool") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(tool)) => Some(tool.as_str()),
+            _ => return Err("tool must be a string or omitted".into()),
+        };
+        if name.is_empty()
+            || name.len() > 200
+            || name.chars().any(char::is_control)
+            || tool.is_some_and(|tool| {
+                tool.is_empty() || tool.len() > 400 || tool.chars().any(char::is_control)
+            })
+        {
+            return Err("Diagnostic server/tool names must be nonempty bounded identifiers".into());
+        }
+        let (cfg, excluded, present, scope, project, explicit) = {
+            let registry = self.registry.lock().await;
+            (
+                registry.servers.get(name).cloned(),
+                registry.excluded.get(name).cloned(),
+                registry.present,
+                registry.scope.clone(),
+                registry.project.clone(),
+                registry.config.is_some(),
+            )
+        };
+        let error = self.config_error.lock().await.clone();
+        let mut connected = false;
+        let (status, reason, action, evidence) = if let Some(error) = error.as_ref() {
+            let status = if error.contains("environment variable")
+                || error.contains("authorization header")
+                || error.contains("clientSecret")
+            {
+                "credentials_missing"
+            } else {
+                "config_invalid"
+            };
+            (
+                status,
+                "Registry validation failed; configuration values are omitted",
+                "Repair the explicit registry/environment, then mcp.refresh(); do not borrow another client's credentials",
+                "configuration",
+            )
+        } else if scope == "none" || std::env::var("REPL_MCP_NO_BRIDGE").as_deref() == Ok("1") {
+            (
+                "broker_disabled",
+                "This broker is disabled",
+                "Enable an explicit project registry or --config; host tools remain a separate client route",
+                "configuration",
+            )
+        } else if let Some(excluded) = excluded.as_deref().filter(|_| cfg.is_none()) {
+            if excluded == "disabled" {
+                (
+                    "not_granted",
+                    "Server entry is disabled",
+                    "Enable this explicit broker entry, then mcp.refresh()",
+                    "configuration",
+                )
+            } else {
+                (
+                    "not_granted",
+                    "Foreign registry entry has no independent broker grant",
+                    "Export an independent --config entry or explicitly grant brokerAllowed; host interactive approvals are not inherited",
+                    "configuration",
+                )
+            }
+        } else if let Some(cfg) = cfg.as_ref() {
+            if tool.is_some_and(|tool| {
+                cfg.allowed_tools
+                    .as_ref()
+                    .is_some_and(|allow| !allow.iter().any(|name| name == tool))
+            }) {
+                (
+                    "not_granted",
+                    "Tool is outside this entry's allowedTools grant",
+                    "Use a granted tool or explicitly update the broker allowlist, then mcp.refresh()",
+                    "configuration",
+                )
+            } else if let Some(oauth) = cfg
+                .oauth
+                .as_ref()
+                .filter(|oauth| oauth.grant_type == "authorization_code")
+                && let Some(path) = oauth.credential_file.as_ref()
+                && tokio::fs::symlink_metadata(path)
+                    .await
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                (
+                    "credentials_missing",
+                    "The independent OAuth credential file has not been created",
+                    "Run repl-mcp --config REGISTRY --oauth-login SERVER; use this broker's independent grant",
+                    "configuration",
+                )
+            } else {
+                let key = transport_key(cfg)?;
+                let slot = self.sessions.lock().await.get(&key).cloned();
+                connected = slot
+                    .as_ref()
+                    .and_then(|slot| slot.try_lock().ok())
+                    .is_some_and(|guard| {
+                        guard.as_ref().is_some_and(|session| !session.is_closed())
+                    });
+                let failure = self
+                    .failures
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|(_, status)| status.clone());
+                if let Some(failure) = failure.as_deref().filter(|_| !connected) {
+                    match failure {
+                        "connection_timeout" => (
+                            "connection_timeout",
+                            "The last connection attempt exhausted its deadline",
+                            "Check downstream server availability and configuration; mcp.refresh() clears the failed-attempt cooldown",
+                            "last_connection_attempt",
+                        ),
+                        "credentials_missing" => (
+                            "credentials_missing",
+                            "The last connection attempt required an independent OAuth grant",
+                            "Configure this broker's credentials or run --oauth-login SERVER, then mcp.refresh()",
+                            "last_connection_attempt",
+                        ),
+                        _ => (
+                            "disconnected",
+                            "The last connection attempt failed; authentication versus transport failure is not proven",
+                            "Check the downstream server and explicit credentials, then mcp.refresh(); no write was retried",
+                            "last_connection_attempt",
+                        ),
+                    }
+                } else if !connected {
+                    (
+                        "disconnected",
+                        "No live transport; lazy startup has not connected or the peer has closed",
+                        "Inspect the explicit entry, then mcp.list_tools(server) to make a bounded connection attempt",
+                        "transport_state",
+                    )
+                } else if let Some(tool) = tool {
+                    let key = serde_json::to_string(cfg)
+                        .map_err(|_| "Cannot identify MCP configuration")?;
+                    let catalogue = self.catalogue.lock().await;
+                    if let Some((at, _)) = catalogue
+                        .get(&key)
+                        .filter(|(at, _)| at.elapsed() >= Duration::from_secs(15))
+                    {
+                        let _ = at;
+                        (
+                            "catalogue_stale",
+                            "The cached catalogue exceeded its freshness window",
+                            "Use mcp.list_tools(server) to refresh before treating a tool as available or missing",
+                            "cached_catalogue",
+                        )
+                    } else if let Some((_, tools)) = catalogue.get(&key) {
+                        if tools
+                            .as_array()
+                            .is_some_and(|tools| tools.iter().any(|entry| entry["name"] == tool))
+                        {
+                            (
+                                "ready",
+                                "Connected and tool present in cached catalogue",
+                                "Call the tool with its validated arguments; mcp.help(server, tool) gives its schema",
+                                "cached_catalogue",
+                            )
+                        } else {
+                            (
+                                "tool_missing",
+                                "The cached catalogue does not contain this granted tool",
+                                "Check the exact tool name and mcp.list_tools(server); refresh if the downstream catalogue changed",
+                                "cached_catalogue",
+                            )
+                        }
+                    } else {
+                        (
+                            "catalogue_not_loaded",
+                            "Connected but no catalogue has been loaded for this grant",
+                            "Use mcp.list_tools(server) to load the catalogue; absence is not established yet",
+                            "transport_state",
+                        )
+                    }
+                } else {
+                    (
+                        "ready",
+                        "A live explicitly configured transport is available",
+                        "Use mcp.list_tools(server) to inspect the catalogue",
+                        "transport_state",
+                    )
+                }
+            }
+        } else if !present {
+            (
+                "registry_absent",
+                "No registry was found for this broker project/scope",
+                "Create a project .mcp.json or supply --config, then mcp.refresh(); a host-client tool may be a separate route",
+                "configuration",
+            )
+        } else {
+            (
+                "server_absent",
+                "This server is absent from the explicit broker registry",
+                "Inspect mcp.servers() and export an independently granted entry; host-only tools cannot be discovered through this local broker",
+                "configuration",
+            )
+        };
+        Ok(
+            json!({"server":name,"tool":tool,"status":status,"reason":reason,"connected":connected,
+            "evidence":evidence,"actions":[action],"network_probe_performed":false,
+            "configuration_error":error,
+            "budgets":{"argument_max_bytes":262144,"result_max_bytes":900000},
+            "provenance":{"project":project,"registry":if explicit {"explicit_config"} else {"project_and_opt_in_scopes"},"scope":scope},
+            "host_client_route":{"availability":"unknown","discoverable_by_broker":false,
+                "action":"Use the host client's own tool only if its catalogue offers it; this broker cannot infer that route from a missing registry entry"}}),
+        )
     }
 
     async fn session(
@@ -513,7 +850,7 @@ impl Broker {
             .lock()
             .await
             .get(&key)
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(60))
         {
             return Err(
                 "MCP connection recently failed; verify configuration then mcp.refresh() to retry"
@@ -570,10 +907,10 @@ impl Broker {
         let session = match connected {
             Ok(session) => session,
             Err(error) => {
-                self.failures
-                    .lock()
-                    .await
-                    .insert(key, tokio::time::Instant::now());
+                self.failures.lock().await.insert(
+                    key,
+                    (tokio::time::Instant::now(), failure_status(&error).into()),
+                );
                 return Err(error);
             }
         };
@@ -679,7 +1016,13 @@ impl Broker {
         }
     }
     pub async fn refresh(&self) -> Result<(), String> {
-        let loaded = self.registry.lock().await.reload();
+        let registry = self.registry.lock().await.clone();
+        let loaded = registry_job(
+            self.registry_slots.clone(),
+            Duration::from_secs(5),
+            move || registry.reload(),
+        )
+        .await;
         let next = match loaded {
             Ok(next) => next,
             Err(error) => {
@@ -765,7 +1108,15 @@ impl Broker {
         }
     }
     pub async fn health(&self) -> Value {
-        let servers = self.registry.lock().await.servers.len();
+        let (servers, project, scope, explicit) = {
+            let registry = self.registry.lock().await;
+            (
+                registry.servers.len(),
+                registry.project.clone(),
+                registry.scope.clone(),
+                registry.config.is_some(),
+            )
+        };
         let slots = self
             .sessions
             .lock()
@@ -781,7 +1132,7 @@ impl Broker {
                 connected += 1;
             }
         }
-        json!({"configured_servers":servers,"connected_transports":connected,"configuration_error":self.config_error.lock().await.clone(),"max_concurrent_requests":32,"authentication":"explicit headers, OAuth client credentials, independent PKCE browser grants", "journal":self.journal.lock().map(|j|j.len()).unwrap_or(0)})
+        json!({"configured_servers":servers,"connected_transports":connected,"configuration_error":self.config_error.lock().await.clone(),"max_concurrent_requests":32,"authentication":"explicit headers, OAuth client credentials, independent PKCE browser grants", "journal":self.journal.lock().map(|j|j.len()).unwrap_or(0),"provenance":{"project":project,"scope":scope,"registry":if explicit {"explicit_config"} else {"project_and_opt_in_scopes"}}})
     }
     pub async fn shutdown(&self) {
         self.calls.close();
@@ -976,6 +1327,17 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+fn failure_status(error: &str) -> &'static str {
+    if error.contains("timeout") || error.contains("connect budget") {
+        "connection_timeout"
+    } else if error.contains("Independent OAuth grant required")
+        || error.contains("OAuth access token unavailable")
+    {
+        "credentials_missing"
+    } else {
+        "disconnected"
+    }
 }
 fn transport_key(config: &ServerConfig) -> Result<String, String> {
     let mut transport = config.clone();
@@ -1738,6 +2100,73 @@ async fn bounded_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn registry_timeout_keeps_actual_blocking_job_bounded() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = registry_job(slots.clone(), Duration::from_millis(30), move || {
+            let _ = blocked.recv();
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(slots.available_permits(), 0);
+        let result: Result<(), String> =
+            registry_job(slots.clone(), Duration::from_millis(10), || {
+                panic!("capacity must prevent scheduling")
+            })
+            .await;
+        assert!(result.is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn explanation_uses_last_attempt_without_connecting_or_exposing_values() {
+        let project = std::env::current_dir().unwrap();
+        let cfg: ServerConfig = serde_json::from_value(json!({"type":"http","url":"https://private.invalid/mcp","headers":{"Authorization":"Bearer do-not-emit"}})).unwrap();
+        let broker = Broker::new(Registry {
+            servers: BTreeMap::from([("peer".into(), cfg.clone())]),
+            config: None,
+            scope: "project".into(),
+            project,
+            present: true,
+            excluded: BTreeMap::from([("foreign".into(), "not_granted".into())]),
+        });
+        let explanation = broker.explain(&json!({"server":"peer"})).await.unwrap();
+        assert_eq!(explanation["status"], "disconnected");
+        assert_eq!(broker.health().await["connected_transports"], 0);
+        assert_eq!(
+            broker.explain(&json!({"server":"foreign"})).await.unwrap()["status"],
+            "not_granted"
+        );
+        broker.failures.lock().await.insert(
+            transport_key(&cfg).unwrap(),
+            (tokio::time::Instant::now(), "connection_timeout".into()),
+        );
+        let explanation = broker.explain(&json!({"server":"peer"})).await.unwrap();
+        assert_eq!(explanation["status"], "connection_timeout");
+        assert_eq!(explanation["network_probe_performed"], false);
+        let rendered = explanation.to_string();
+        assert!(!rendered.contains("private.invalid") && !rendered.contains("do-not-emit"));
+    }
+    #[test]
+    fn credentials_and_project_bound_transport_identity_preserves_distinctions() {
+        let cfg: ServerConfig = serde_json::from_value(json!({"command":"peer","cwd":"/project-a","env":{"TOKEN":"credential-a"},"allowedTools":["read"]})).unwrap();
+        let mut alias = cfg.clone();
+        alias.allowed_tools = Some(vec!["write".into()]);
+        assert_eq!(transport_key(&cfg).unwrap(), transport_key(&alias).unwrap());
+        alias.env.insert("TOKEN".into(), "credential-b".into());
+        assert_ne!(transport_key(&cfg).unwrap(), transport_key(&alias).unwrap());
+        alias = cfg.clone();
+        alias.cwd = Some("/project-b".into());
+        assert_ne!(transport_key(&cfg).unwrap(), transport_key(&alias).unwrap());
+    }
     #[test]
     fn validates_before_effects() {
         let schema = json!({"type":"object","required":["x"],"properties":{"x":{"type":"integer"}},"additionalProperties":false});
@@ -1808,6 +2237,9 @@ mod tests {
             servers: BTreeMap::new(),
             config: None,
             scope: "none".into(),
+            project: std::env::current_dir().unwrap(),
+            present: false,
+            excluded: BTreeMap::new(),
         });
         broker
             .journal

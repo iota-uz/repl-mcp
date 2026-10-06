@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.1.0 — 2026-10-06
+
+- Add independent Python sessions with selected project/interpreter, lazy workers,
+  per-session history and cancellation. Same-project sessions reuse broker peers;
+  different projects retain separate registry and credential contexts.
+- Add session open/list/inspect/close tools, stable server/session/generation IDs and
+  `expected_generation` execution guards. Inspection exposes bounded names/types
+  without user hooks; retained results keep their original generation.
+- Add `python_execute_file` with literal argv, real source filenames/encoding/import
+  behavior, persistent execution and a fresh owned worker preserving session state.
+- Add `mcp.explain` for registry/grant/credential/transport/catalogue diagnostics
+  without implicit network probes or borrowed host-client authorization.
+- Add server-owned JSON/text/binary artifacts, automatic references for large safe
+  results, explicit range reads, verified saves, forwarding and deletion. Retention
+  survives worker reset; session close and server exit release owned content.
+- Preserve healthy shared MCP transports after individual protocol/cancellation
+  errors. Scope effect metadata to sessions and keep unknown write outcomes explicit.
+- Add historical mechanism evaluations for shared variables/worktree paths,
+  project dependencies, stale state, saved scripts, write reconciliation, parallel
+  cancellation and payload retention. These are deterministic protocol evaluations,
+  not measurements of live model behavior or production failure rates.
+
 ## 3.0.1 — 2026-10-06
 
 - Restore Claude Code tool catalogue compatibility by including top-level

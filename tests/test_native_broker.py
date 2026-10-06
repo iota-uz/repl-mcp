@@ -87,15 +87,20 @@ def oauth_peer():
             if method == "server/discover":
                 return self.reply({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "legacy"}})
             if method == "initialize":
+                state["initializations"] = state.get("initializations", 0) + 1
                 result = {"protocolVersion": params.get("protocolVersion", "2025-11-25"), "capabilities": {"tools": {}},
                           "serverInfo": {"name": "hermetic-http", "version": "1"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "inputSchema": {"type": "object", "additionalProperties": False}}
-                                    for name in ["echo", "oversized"]]}
+                                    for name in ["echo", "oversized", "delivery_large"]]}
             elif method == "tools/call":
                 assert self.headers.get("Authorization", "").startswith("Bearer hermetic-access-")
+                if state.pop("protocol_error_once", False):
+                    return self.reply({"jsonrpc":"2.0", "id":request["id"],
+                                       "error":{"code":-32602,"message":"hermetic argument rejection"}})
                 state["effects"] += 1
-                result = {"content": [{"type": "text", "text": "x" * 1100000 if params["name"] == "oversized" else "http works"}],
+                text = "x" * 1100000 if params["name"] == "oversized" else "x" * 950000 if params["name"] == "delivery_large" else "http works"
+                result = {"content": [{"type": "text", "text": text}],
                           "structuredContent": {"ok": True}, "isError": False}
             else:
                 result = {}
@@ -311,5 +316,76 @@ def test_aliases_share_transport_but_keep_distinct_tool_policy(binary, tmp_path)
         assert client.execute("mcp.call('read_alias', 'multi')")["isError"]
         health = client.request("tools/call", {"name": "python_health", "arguments": {}})["structuredContent"]
         assert health["broker"]["connected_transports"] == 1
+    finally:
+        client.close()
+
+
+def test_protocol_error_does_not_destroy_healthy_shared_http_transport(binary, tmp_path, oauth_peer):
+    url, state = oauth_peer
+    state["protocol_error_once"] = True
+    config = registry(tmp_path / "broker.json", url,
+                      {"grantType":"client_credentials", "clientId":"hermetic-client", "clientSecret":"hermetic-secret"})
+    client = NativeClient(binary, tmp_path, config)
+    try:
+        assert client.execute("mcp.call('http', 'echo')")["isError"]
+        assert not client.execute("mcp.call('http', 'echo')")["isError"]
+        assert state["initializations"] == 1, "Protocol rejection unnecessarily reconnected the shared transport"
+        journal = client.execute("mcp.journal()")["structuredContent"]["value"]
+        assert journal[0]["status"] == "outcome_unknown"
+        assert journal[1]["status"] == "completed"
+        assert journal[0]["session_id"] == journal[1]["session_id"]
+    finally:
+        client.close()
+
+
+def test_large_known_result_reports_delivery_failure_without_retry_or_losing_completion(binary, tmp_path, oauth_peer):
+    url, state = oauth_peer
+    config = registry(tmp_path / "broker.json", url,
+                      {"grantType":"client_credentials", "clientId":"hermetic-client", "clientSecret":"hermetic-secret"})
+    client = NativeClient(binary, tmp_path, config)
+    try:
+        failed = client.execute("mcp.call('http', 'delivery_large')")
+        assert failed["isError"] and "known outcome" in failed["structuredContent"]["error"], failed
+        assert state["effects"] == 1
+        journal = client.execute("mcp.journal()")["structuredContent"]["value"]
+        assert journal[-1]["status"] == "completed", journal
+        assert journal[-1]["id"] in failed["structuredContent"]["error"]
+        assert not client.execute("mcp.call('http', 'echo')")["isError"]
+        assert state["initializations"] == 1 and state["effects"] == 2
+    finally:
+        client.close()
+
+
+def test_cancelling_one_call_keeps_shared_peer_and_other_effect_owned(binary, tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "broker.json"
+    config.write_text(json.dumps({"mcpServers":{"peer":{"command":os.sys.executable,
+                    "args":[str(root / "tests/fixtures/native_mcp_fixture.py")]}}}))
+    cancelled_marker, survivor_marker = tmp_path / "cancelled", tmp_path / "survivor"
+    client = NativeClient(binary, tmp_path, config)
+    try:
+        code = f"""import asyncio
+first = asyncio.create_task(mcp.acall('peer', 'slow_write', arguments={{'marker': {str(cancelled_marker)!r}}}))
+second = asyncio.create_task(mcp.acall('peer', 'slow_write', arguments={{'marker': {str(survivor_marker)!r}}}))
+for _ in range(30):
+    if len([entry for entry in mcp.journal() if entry['status'] == 'dispatched']) >= 2:
+        break
+    await asyncio.sleep(.02)
+else:
+    raise AssertionError('Both requests never reached dispatch')
+first.cancel()
+await asyncio.gather(first, return_exceptions=True)
+await second
+mcp.journal()
+"""
+        result = client.execute(code)
+        assert not result["isError"], result
+        assert not cancelled_marker.exists() and survivor_marker.read_text() == "committed"
+        journal = result["structuredContent"]["value"]
+        assert sorted(entry["status"] for entry in journal) == ["completed", "outcome_unknown"]
+        assert len({entry["run_id"] for entry in journal}) == 1
+        assert len({entry["session_id"] for entry in journal}) == 1
+        assert not client.execute("mcp.call('peer', 'echo')")["isError"]
+        assert client.request("tools/call", {"name":"python_health", "arguments":{}})["structuredContent"]["broker"]["connected_transports"] == 1
     finally:
         client.close()

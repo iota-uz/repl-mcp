@@ -24,7 +24,9 @@ class Client:
         self.backlog = []
         self.serial = 0
         threading.Thread(target=self.read, daemon=True).start()
-        assert self.next("ready")["pid"] == self.process.pid
+        ready = self.next("ready")
+        assert ready["pid"] == self.process.pid
+        assert Path(ready["python_executable"]).resolve() == Path(sys.executable).resolve()
 
     def read(self):
         for line in self.process.stdout:
@@ -87,6 +89,112 @@ def test_persistent_async_loop_and_state(client):
     result = client.execute("await asyncio.sleep(0)\nevent.set()\n[loop is asyncio.get_running_loop() if False else loop is asyncio.get_event_loop(), event.is_set(), x + 1]")
     assert result["value"] == [True, True, 42]
     assert client.execute("async def answer():\n    return asyncio.get_running_loop() is loop\nawait answer()")["value"] is True
+
+
+def test_namespace_metadata_bypasses_all_custom_hooks(client):
+    assert client.execute("effects = []\nclass Meta(type):\n    @property\n    def __name__(cls):\n        effects.append('descriptor')\n        return 'bad'\n    def __eq__(cls, other):\n        effects.append('equality')\n        return False\n    def __getattribute__(cls, name):\n        effects.append('attribute')\n        return super().__getattribute__(name)\nclass Hostile(metaclass=Meta):\n    def __repr__(self):\n        effects.append('repr')\n        return 'bad'\nx = Hostile()")["success"]
+    client.serial += 1
+    client.send({"type": "execute", "id": f"test-{client.serial}", "inventory": True})
+    result = client.next("result")["result"]
+    assert result["success"]
+    assert next(item for item in result["value"]["variables"] if item["name"] == "x")["type"] == "Hostile"
+    assert client.execute("effects")["value"] == []
+    assert client.execute("x")["success"]
+    assert client.execute("effects")["value"] == []
+
+
+def test_saved_file_real_source_import_encoding_and_argument_restoration(client, tmp_path):
+    (tmp_path / "helper.py").write_text("answer = 42\n")
+    source = tmp_path / "task.py"
+    source.write_bytes("# coding: latin-1\nimport sys, helper\nseen = [__name__, __file__, sys.argv, helper.answer, 'café']\nseen\n".encode("latin-1"))
+    assert client.execute("import sys\nold_argv = sys.argv\nold_path = sys.path")["success"]
+    client.serial += 1
+    client.send({"type": "execute", "id": f"test-{client.serial}", "source_path": str(source), "argv": ["hello"]})
+    result = client.next("result")["result"]
+    assert result["value"] == ["__main__", str(source), [str(source), "hello"], 42, "café"]
+    assert client.execute("[sys.argv is old_argv, sys.path is old_path, __name__, '__file__' in globals(), seen[3]]")["value"] == [True, True, "__repl__", False, 42]
+    source.write_text("raise ValueError('saved-source-error')\n")
+    client.serial += 1
+    client.send({"type": "execute", "id": f"test-{client.serial}", "source_path": str(source), "argv": []})
+    error = client.next("result")["result"]
+    assert not error["success"] and str(source) in error["error"] and "line 1" in error["error"]
+    assert client.execute("[sys.argv is old_argv, sys.path is old_path]")["value"] == [True, True]
+
+
+def test_saved_file_bounded_input_validation(client, tmp_path):
+    source = tmp_path / "large.py"
+    source.write_bytes(b" " * (256 * 1024 + 1))
+    client.serial += 1
+    client.send({"type": "execute", "id": f"test-{client.serial}", "source_path": str(source)})
+    result = client.next("result")["result"]
+    assert not result["success"] and "256 KiB" in result["error"]
+    assert client.execute("40 + 2")["value"] == 42
+
+
+@pytest.mark.parametrize("expression,status,stderr", [("None", 0, ""), ("0", 0, ""), ("2", 2, ""), ("'stopped'", 1, "stopped\n")])
+def test_saved_file_exit_status_and_next_cell(client, tmp_path, expression, status, stderr):
+    source = tmp_path / "exit.py"
+    source.write_text(f"import sys\nmarker = 42\nsys.exit({expression})\nmarker = 99\n")
+    client.serial += 1
+    client.send({"type": "execute", "id": f"test-{client.serial}", "source_path": str(source)})
+    result = client.next("result")["result"]
+    assert result["success"] is (status == 0)
+    assert result["exit_code"] == status and result["stderr"] == stderr
+    assert client.execute("marker")["value"] == 42
+    assert not client.execute("raise SystemExit(0)")["success"]
+
+
+def test_oversized_result_artifact_rpc_and_temporary_cleanup(client):
+    client.serial += 1
+    identifier = f"test-{client.serial}"
+    client.send({"type": "execute", "id": identifier, "code": "'x' * 100000", "artifact_enabled": True})
+    rpc = client.next("rpc")
+    assert rpc["op"] == "artifact.begin" and rpc["run_id"] == identifier
+    assert rpc["params"]["format"] == "text"
+    client.send({"type": "rpc_result", "id": rpc["id"], "result": {"upload_id": "upload-1"}})
+    received = bytearray()
+    chunks = 0
+    import base64
+    while True:
+        rpc = client.next("rpc")
+        assert "path" not in rpc["params"]
+        if rpc["op"] == "artifact.commit":
+            break
+        assert rpc["op"] == "artifact.append"
+        assert rpc["params"]["offset"] == len(received)
+        chunk = base64.b64decode(rpc["params"]["data"])
+        assert len(chunk) <= 32768
+        received.extend(chunk)
+        chunks += 1
+        client.send({"type": "rpc_result", "id": rpc["id"], "result": {"size": len(received)}})
+    assert received == b"x" * 100000 and chunks == 4
+    reference = {"id": "artifact-1", "size": 100000, "format": "text", "sha256": "test"}
+    client.send({"type": "rpc_result", "id": rpc["id"], "result": reference})
+    result = client.next("result")["result"]
+    assert result["success"] and result["artifact"] == reference and result["truncated"]["return"]
+    assert len(result["return_value"].encode()) <= 20000
+
+
+def test_artifact_upload_error_aborts_before_reporting_failure(client):
+    client.start("artifact(b'hello')")
+    rpc = client.next("rpc")
+    assert rpc["op"] == "artifact.begin"
+    client.send({"type": "rpc_result", "id": rpc["id"], "result": {"upload_id": "failed-upload"}})
+    rpc = client.next("rpc")
+    assert rpc["op"] == "artifact.append"
+    client.send({"type": "rpc_result", "id": rpc["id"], "error": "upload capacity error"})
+    abort = client.next("rpc")
+    assert abort["op"] == "artifact.abort"
+    assert abort["params"]["upload_id"] == "failed-upload"
+    client.send({"type": "rpc_result", "id": abort["id"], "result": {"aborted": True}})
+    result = client.next("result")["result"]
+    assert not result["success"] and "upload capacity error" in result["error"]
+
+
+def test_artifact_custom_objects_fail_without_repr_and_do_not_dispatch(client):
+    result = client.execute("effects = []\nclass Evil:\n    def __repr__(self):\n        effects.append(1)\n        return 'evil'\nartifact({'nested': Evil()})")
+    assert not result["success"] and "exact JSON" in result["error"]
+    assert client.execute("effects")["value"] == []
 
 
 def test_output_bound_during_writes_and_unicode(client):
@@ -191,6 +299,22 @@ def test_cancelled_rpc_late_result_does_not_poison_next_run(client):
     assert not client.next("result")["result"]["success"]
     client.send({"type": "rpc_result", "id": request["id"], "result": {"content": []}})
     assert client.execute("42")["value"] == 42
+
+
+def test_cancelling_one_async_rpc_signals_only_its_origin(client):
+    run = client.start("import asyncio\nfirst = asyncio.create_task(mcp.acall('fixture', 'slow'))\nawait asyncio.sleep(0.05)\nfirst.cancel()\ntry:\n    await first\nexcept asyncio.CancelledError:\n    pass\nawait mcp.acall('fixture', 'second')")
+    first = client.next("rpc")
+    cancelled = client.next("rpc_cancel")
+    assert cancelled == {"type": "rpc_cancel", "id": first["id"], "run_id": run}
+    second = client.next("rpc")
+    assert second["id"] != first["id"] and second["run_id"] == run
+    client.send({"type": "rpc_result", "id": second["id"], "result": {"content": [], "structuredContent": 42}})
+    assert client.next("result")["result"]["value"]["structuredContent"] == 42
+    # A late reply to the cancelled call cannot poison the namespace or trigger
+    # another cancellation frame for the completed second call.
+    client.send({"type": "rpc_result", "id": first["id"], "result": {"content": []}})
+    assert client.execute("42")["value"] == 42
+    assert not any(item["type"] == "rpc_cancel" for item in client.backlog)
 
 
 def test_explicit_checkpoint_safe_atomic_and_recovery(client, tmp_path):
